@@ -2,11 +2,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use gpui::AsyncAppContext;
-use http::github::{latest_github_release, GitHubLspBinaryVersion};
+use http_client::github::{latest_github_release, GitHubLspBinaryVersion};
 pub use language::*;
 use lsp::LanguageServerBinary;
-use project::project_settings::{BinarySettings, ProjectSettings};
-use settings::Settings;
+use project::{lsp_store::language_server_settings, project_settings::BinarySettings};
 use smol::fs::{self, File};
 use std::{any::Any, env::consts, path::PathBuf, sync::Arc};
 use util::{fs::remove_matching, maybe, ResultExt};
@@ -29,10 +28,7 @@ impl super::LspAdapter for CLspAdapter {
         cx: &AsyncAppContext,
     ) -> Option<LanguageServerBinary> {
         let configured_binary = cx.update(|cx| {
-            ProjectSettings::get_global(cx)
-                .lsp
-                .get(Self::SERVER_NAME)
-                .and_then(|s| s.binary.clone())
+            language_server_settings(delegate, Self::SERVER_NAME, cx).and_then(|s| s.binary.clone())
         });
 
         match configured_binary {
@@ -197,8 +193,16 @@ impl super::LspAdapter for CLspAdapter {
                 let detail = completion.detail.as_ref().unwrap();
                 let text = format!("{} {}", detail, label);
                 let runs = language.highlight_text(&Rope::from(text.as_str()), 0..text.len());
+                let filter_start = detail.len() + 1;
+                let filter_end =
+                    if let Some(end) = text.rfind('(').filter(|end| *end > filter_start) {
+                        end
+                    } else {
+                        text.len()
+                    };
+
                 return Some(CodeLabel {
-                    filter_range: detail.len() + 1..text.rfind('(').unwrap_or(text.len()),
+                    filter_range: filter_start..filter_end,
                     text,
                     runs,
                 });
@@ -342,7 +346,7 @@ mod tests {
                 });
             });
         });
-        let language = crate::language("c", tree_sitter_c::language());
+        let language = crate::language("c", tree_sitter_c::LANGUAGE.into());
 
         cx.new_model(|cx| {
             let mut buffer = Buffer::local("", cx).with_language(language, cx);

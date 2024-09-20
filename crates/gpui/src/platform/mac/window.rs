@@ -9,7 +9,7 @@ use crate::{
 use block::ConcreteBlock;
 use cocoa::{
     appkit::{
-        CGPoint, NSApplication, NSBackingStoreBuffered, NSColor, NSEvent, NSEventModifierFlags,
+        NSApplication, NSBackingStoreBuffered, NSColor, NSEvent, NSEventModifierFlags,
         NSFilenamesPboardType, NSPasteboard, NSScreen, NSView, NSViewHeightSizable,
         NSViewWidthSizable, NSWindow, NSWindowButton, NSWindowCollectionBehavior,
         NSWindowOcclusionState, NSWindowStyleMask, NSWindowTitleVisibility,
@@ -20,7 +20,7 @@ use cocoa::{
         NSSize, NSString, NSUInteger,
     },
 };
-use core_graphics::display::{CGDirectDisplayID, CGRect};
+use core_graphics::display::{CGDirectDisplayID, CGPoint, CGRect};
 use ctor::ctor;
 use futures::channel::oneshot;
 use objc::{
@@ -54,7 +54,7 @@ static mut VIEW_CLASS: *const Class = ptr::null();
 
 #[allow(non_upper_case_globals)]
 const NSWindowStyleMaskNonactivatingPanel: NSWindowStyleMask =
-    unsafe { NSWindowStyleMask::from_bits_unchecked(1 << 7) };
+    NSWindowStyleMask::from_bits_retain(1 << 7);
 #[allow(non_upper_case_globals)]
 const NSNormalWindowLevel: NSInteger = 0;
 #[allow(non_upper_case_globals)]
@@ -233,7 +233,7 @@ unsafe fn build_classes() {
 pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -> Point<Pixels> {
     point(
         px(position.x as f32),
-        // MacOS screen coordinates are relative to bottom left
+        // macOS screen coordinates are relative to bottom left
         window_height - px(position.y as f32),
     )
 }
@@ -310,7 +310,7 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
 }
 
 #[allow(clippy::enum_variant_names)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum ImeInput {
     InsertText(String, Option<Range<usize>>),
     SetMarkedText(String, Option<Range<usize>>, Option<Range<usize>>),
@@ -344,6 +344,7 @@ struct MacWindowState {
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
     fullscreen_restore_bounds: Bounds<Pixels>,
+    ime_composing: bool,
 }
 
 impl MacWindowState {
@@ -448,17 +449,16 @@ impl MacWindowState {
         window_frame.origin.y =
             screen_frame.size.height - window_frame.origin.y - window_frame.size.height;
 
-        let bounds = Bounds::new(
+        Bounds::new(
             point(
                 px((window_frame.origin.x - screen_frame.origin.x) as f32),
-                px((window_frame.origin.y - screen_frame.origin.y) as f32),
+                px((window_frame.origin.y + screen_frame.origin.y) as f32),
             ),
             size(
                 px(window_frame.size.width as f32),
                 px(window_frame.size.height as f32),
             ),
-        );
-        bounds
+        )
     }
 
     fn content_size(&self) -> Size<Pixels> {
@@ -496,7 +496,6 @@ impl MacWindow {
     pub fn open(
         handle: AnyWindowHandle,
         WindowParams {
-            window_background,
             bounds,
             titlebar,
             kind,
@@ -504,6 +503,7 @@ impl MacWindow {
             focus,
             show,
             display_id,
+            window_min_size,
         }: WindowParams,
         executor: ForegroundExecutor,
         renderer_context: renderer::Context,
@@ -536,7 +536,7 @@ impl MacWindow {
 
             let display = display_id
                 .and_then(MacDisplay::find_by_id)
-                .unwrap_or_else(|| MacDisplay::primary());
+                .unwrap_or_else(MacDisplay::primary);
 
             let mut target_screen = nil;
             let mut screen_frame = None;
@@ -545,7 +545,7 @@ impl MacWindow {
             let count: u64 = cocoa::foundation::NSArray::count(screens);
             for i in 0..count {
                 let screen = cocoa::foundation::NSArray::objectAtIndex(screens, i);
-                let frame = NSScreen::visibleFrame(screen);
+                let frame = NSScreen::frame(screen);
                 let display_id = display_id_for_screen(screen);
                 if display_id == display.0 {
                     screen_frame = Some(frame);
@@ -556,7 +556,7 @@ impl MacWindow {
             let screen_frame = screen_frame.unwrap_or_else(|| {
                 let screen = NSScreen::mainScreen(nil);
                 target_screen = screen;
-                NSScreen::visibleFrame(screen)
+                NSScreen::frame(screen)
             });
 
             let window_rect = NSRect::new(
@@ -601,7 +601,7 @@ impl MacWindow {
                     native_window as *mut _,
                     native_view as *mut _,
                     bounds.size.map(|pixels| pixels.0),
-                    window_background != WindowBackgroundAppearance::Opaque,
+                    false,
                 ),
                 request_frame_callback: None,
                 event_callback: None,
@@ -623,6 +623,7 @@ impl MacWindow {
                 external_files_dragged: false,
                 first_mouse: false,
                 fullscreen_restore_bounds: Bounds::default(),
+                ime_composing: false,
             })));
 
             (*native_window).set_ivar(
@@ -643,6 +644,13 @@ impl MacWindow {
             }
 
             native_window.setMovable_(is_movable as BOOL);
+
+            if let Some(window_min_size) = window_min_size {
+                native_window.setContentMinSize_(NSSize {
+                    width: window_min_size.width.to_f64(),
+                    height: window_min_size.height.to_f64(),
+                });
+            }
 
             if titlebar.map_or(true, |titlebar| titlebar.appears_transparent) {
                 native_window.setTitlebarAppearsTransparent_(YES);
@@ -665,8 +673,6 @@ impl MacWindow {
 
             native_window.setContentView_(native_view.autorelease());
             native_window.makeFirstResponder_(native_view);
-
-            window.set_background_appearance(window_background);
 
             match kind {
                 WindowKind::Normal => {
@@ -729,6 +735,25 @@ impl MacWindow {
             } else {
                 None
             }
+        }
+    }
+
+    pub fn ordered_windows() -> Vec<AnyWindowHandle> {
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let windows: id = msg_send![app, orderedWindows];
+            let count: NSUInteger = msg_send![windows, count];
+
+            let mut window_handles = Vec::new();
+            for i in 0..count {
+                let window: id = msg_send![windows, objectAtIndex:i];
+                if msg_send![window, isKindOfClass: WINDOW_CLASS] {
+                    let handle = get_window_state(&*window).lock().handle;
+                    window_handles.push(handle);
+                }
+            }
+
+            window_handles
         }
     }
 }
@@ -933,6 +958,11 @@ impl PlatformWindow for MacWindow {
         unsafe { self.0.lock().native_window.isKeyWindow() == YES }
     }
 
+    // is_hovered is unused on macOS. See WindowContext::is_window_hovered.
+    fn is_hovered(&self) -> bool {
+        false
+    }
+
     fn set_title(&mut self, title: &str) {
         unsafe {
             let app = NSApplication::sharedApplication(nil);
@@ -946,7 +976,7 @@ impl PlatformWindow for MacWindow {
 
     fn set_app_id(&mut self, _app_id: &str) {}
 
-    fn set_background_appearance(&mut self, background_appearance: WindowBackgroundAppearance) {
+    fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();
         this.renderer
             .update_transparency(background_appearance != WindowBackgroundAppearance::Opaque);
@@ -1054,6 +1084,8 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().activate_callback = Some(callback);
     }
 
+    fn on_hover_status_change(&self, _: Box<dyn FnMut(bool)>) {}
+
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>) {
         self.0.as_ref().lock().resize_callback = Some(callback);
     }
@@ -1083,12 +1115,15 @@ impl PlatformWindow for MacWindow {
         self.0.lock().renderer.sprite_atlas().clone()
     }
 
-    fn show_window_menu(&self, _position: Point<Pixels>) {}
+    fn gpu_specs(&self) -> Option<crate::GPUSpecs> {
+        None
+    }
 
-    fn start_system_move(&self) {}
-
-    fn should_render_window_controls(&self) -> bool {
-        false
+    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
+        unsafe {
+            let input_context: id = msg_send![class!(NSTextInputContext), currentInputContext];
+            let _: () = msg_send![input_context, invalidateCharacterCoordinates];
+        }
     }
 }
 
@@ -1234,6 +1269,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
         let mut lock = window_state.lock();
         let previous_keydown_inserted_text = lock.previous_keydown_inserted_text.take();
         let mut last_inserts = lock.last_ime_inputs.take().unwrap();
+        let ime_composing = std::mem::take(&mut lock.ime_composing);
 
         let mut callback = lock.event_callback.take();
         drop(lock);
@@ -1248,7 +1284,8 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
         let is_composing =
             with_input_handler(this, |input_handler| input_handler.marked_text_range())
                 .flatten()
-                .is_some();
+                .is_some()
+                || ime_composing;
 
         if let Some((text, range)) = last_insert {
             if !is_composing {
@@ -1272,11 +1309,11 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 
             if !handled && is_held {
                 if let Some(text) = previous_keydown_inserted_text {
-                    // MacOS IME is a bit funky, and even when you've told it there's nothing to
+                    // macOS IME is a bit funky, and even when you've told it there's nothing to
                     // enter it will still swallow certain keys (e.g. 'f', 'j') and not others
                     // (e.g. 'n'). This is a problem for certain kinds of views, like the terminal.
                     with_input_handler(this, |input_handler| {
-                        if input_handler.selected_text_range().is_none() {
+                        if input_handler.selected_text_range(false).is_none() {
                             handled = true;
                             input_handler.replace_text_in_range(None, &text)
                         }
@@ -1648,10 +1685,12 @@ extern "C" fn marked_range(this: &Object, _: Sel) -> NSRange {
 }
 
 extern "C" fn selected_range(this: &Object, _: Sel) -> NSRange {
-    let selected_range_result =
-        with_input_handler(this, |input_handler| input_handler.selected_text_range()).flatten();
+    let selected_range_result = with_input_handler(this, |input_handler| {
+        input_handler.selected_text_range(false)
+    })
+    .flatten();
 
-    selected_range_result.map_or(NSRange::invalid(), |range| range.into())
+    selected_range_result.map_or(NSRange::invalid(), |selection| selection.range.into())
 }
 
 extern "C" fn first_rect_for_character_range(
@@ -1660,9 +1699,13 @@ extern "C" fn first_rect_for_character_range(
     range: NSRange,
     _: id,
 ) -> NSRect {
-    let frame = unsafe {
-        let window = get_window_state(this).lock().native_window;
-        NSView::frame(window)
+    let frame: NSRect = unsafe {
+        let state = get_window_state(this);
+        let lock = state.lock();
+        let mut frame = NSWindow::frame(lock.native_window);
+        let content_layout_rect: CGRect = msg_send![lock.native_window, contentLayoutRect];
+        frame.origin.y -= frame.size.height - content_layout_rect.size.height;
+        frame
     };
     with_input_handler(this, |input_handler| {
         input_handler.bounds_for_range(range.to_range()?)
@@ -1911,7 +1954,7 @@ fn send_to_input_handler(window: &Object, ime: ImeInput) {
         let mut lock = window_state.lock();
 
         if let Some(mut input_handler) = lock.input_handler.take() {
-            match ime.clone() {
+            match ime {
                 ImeInput::InsertText(text, range) => {
                     if let Some(ime_input) = lock.last_ime_inputs.as_mut() {
                         ime_input.push((text, range));
@@ -1922,6 +1965,7 @@ fn send_to_input_handler(window: &Object, ime: ImeInput) {
                     input_handler.replace_text_in_range(range, &text)
                 }
                 ImeInput::SetMarkedText(text, range, marked_range) => {
+                    lock.ime_composing = true;
                     drop(lock);
                     input_handler.replace_and_mark_text_in_range(range, &text, marked_range)
                 }
@@ -1931,6 +1975,12 @@ fn send_to_input_handler(window: &Object, ime: ImeInput) {
                 }
             }
             window_state.lock().input_handler = Some(input_handler);
+        } else {
+            if let ImeInput::InsertText(text, range) = ime {
+                if let Some(ime_input) = lock.last_ime_inputs.as_mut() {
+                    ime_input.push((text, range));
+                }
+            }
         }
     }
 }

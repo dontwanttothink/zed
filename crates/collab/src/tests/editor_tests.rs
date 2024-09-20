@@ -28,7 +28,7 @@ use language::{
 use multi_buffer::MultiBufferRow;
 use project::{
     project_settings::{InlineBlameSettings, ProjectSettings},
-    SERVER_PROGRESS_DEBOUNCE_TIMEOUT,
+    SERVER_PROGRESS_THROTTLE_TIMEOUT,
 };
 use recent_projects::disconnected_overlay::DisconnectedOverlay;
 use rpc::RECEIVE_TIMEOUT;
@@ -43,7 +43,7 @@ use std::{
     },
 };
 use text::Point;
-use workspace::Workspace;
+use workspace::{CloseIntent, Workspace};
 
 #[gpui::test(iterations = 10)]
 async fn test_host_disconnect(
@@ -76,7 +76,7 @@ async fn test_host_disconnect(
     let active_call_a = cx_a.read(ActiveCall::global);
     let (project_a, worktree_id) = client_a.build_local_project("/a", cx_a).await;
 
-    let worktree_a = project_a.read_with(cx_a, |project, _| project.worktrees().next().unwrap());
+    let worktree_a = project_a.read_with(cx_a, |project, cx| project.worktrees(cx).next().unwrap());
     let project_id = active_call_a
         .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
         .await
@@ -134,7 +134,9 @@ async fn test_host_disconnect(
 
     // Ensure client B is not prompted to save edits when closing window after disconnecting.
     let can_close = workspace_b
-        .update(cx_b, |workspace, cx| workspace.prepare_to_close(true, cx))
+        .update(cx_b, |workspace, cx| {
+            workspace.prepare_to_close(CloseIntent::Quit, cx)
+        })
         .unwrap()
         .await
         .unwrap();
@@ -282,7 +284,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
     let active_call_a = cx_a.read(ActiveCall::global);
 
     client_a.language_registry().add(rust_lang());
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             capabilities: lsp::ServerCapabilities {
@@ -344,7 +346,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
         .handle_request::<lsp::request::Completion, _, _>(|params, _| async move {
             assert_eq!(
                 params.text_document_position.text_document.uri,
-                lsp::Uri::from_file_path("/a/main.rs").unwrap().into(),
+                lsp::Url::from_file_path("/a/main.rs").unwrap(),
             );
             assert_eq!(
                 params.text_document_position.position,
@@ -461,7 +463,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
         .handle_request::<lsp::request::Completion, _, _>(|params, _| async move {
             assert_eq!(
                 params.text_document_position.text_document.uri,
-                lsp::Uri::from_file_path("/a/main.rs").unwrap().into(),
+                lsp::Url::from_file_path("/a/main.rs").unwrap(),
             );
             assert_eq!(
                 params.text_document_position.position,
@@ -550,7 +552,7 @@ async fn test_collaborating_with_code_actions(
     client_a.language_registry().add(rust_lang());
     let mut fake_language_servers = client_a
         .language_registry()
-        .register_fake_lsp_adapter("Rust", FakeLspAdapter::default());
+        .register_fake_lsp("Rust", FakeLspAdapter::default());
 
     client_a
         .fs()
@@ -585,7 +587,7 @@ async fn test_collaborating_with_code_actions(
         .handle_request::<lsp::request::CodeActionRequest, _, _>(|params, _| async move {
             assert_eq!(
                 params.text_document.uri,
-                lsp::Uri::from_file_path("/a/main.rs").unwrap().into(),
+                lsp::Url::from_file_path("/a/main.rs").unwrap(),
             );
             assert_eq!(params.range.start, lsp::Position::new(0, 0));
             assert_eq!(params.range.end, lsp::Position::new(0, 0));
@@ -607,7 +609,7 @@ async fn test_collaborating_with_code_actions(
         .handle_request::<lsp::request::CodeActionRequest, _, _>(|params, _| async move {
             assert_eq!(
                 params.text_document.uri,
-                lsp::Uri::from_file_path("/a/main.rs").unwrap().into(),
+                lsp::Url::from_file_path("/a/main.rs").unwrap(),
             );
             assert_eq!(params.range.start, lsp::Position::new(1, 31));
             assert_eq!(params.range.end, lsp::Position::new(1, 31));
@@ -619,7 +621,7 @@ async fn test_collaborating_with_code_actions(
                         changes: Some(
                             [
                                 (
-                                    lsp::Uri::from_file_path("/a/main.rs").unwrap().into(),
+                                    lsp::Url::from_file_path("/a/main.rs").unwrap(),
                                     vec![lsp::TextEdit::new(
                                         lsp::Range::new(
                                             lsp::Position::new(1, 22),
@@ -629,7 +631,7 @@ async fn test_collaborating_with_code_actions(
                                     )],
                                 ),
                                 (
-                                    lsp::Uri::from_file_path("/a/other.rs").unwrap().into(),
+                                    lsp::Url::from_file_path("/a/other.rs").unwrap(),
                                     vec![lsp::TextEdit::new(
                                         lsp::Range::new(
                                             lsp::Position::new(0, 0),
@@ -689,7 +691,7 @@ async fn test_collaborating_with_code_actions(
                     changes: Some(
                         [
                             (
-                                lsp::Uri::from_file_path("/a/main.rs").unwrap().into(),
+                                lsp::Url::from_file_path("/a/main.rs").unwrap(),
                                 vec![lsp::TextEdit::new(
                                     lsp::Range::new(
                                         lsp::Position::new(1, 22),
@@ -699,7 +701,7 @@ async fn test_collaborating_with_code_actions(
                                 )],
                             ),
                             (
-                                lsp::Uri::from_file_path("/a/other.rs").unwrap().into(),
+                                lsp::Url::from_file_path("/a/other.rs").unwrap(),
                                 vec![lsp::TextEdit::new(
                                     lsp::Range::new(
                                         lsp::Position::new(0, 0),
@@ -755,7 +757,7 @@ async fn test_collaborating_with_renames(cx_a: &mut TestAppContext, cx_b: &mut T
 
     // Set up a fake language server.
     client_a.language_registry().add(rust_lang());
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             capabilities: lsp::ServerCapabilities {
@@ -897,14 +899,14 @@ async fn test_collaborating_with_renames(cx_a: &mut TestAppContext, cx_b: &mut T
                 changes: Some(
                     [
                         (
-                            lsp::Uri::from_file_path("/dir/one.rs").unwrap().into(),
+                            lsp::Url::from_file_path("/dir/one.rs").unwrap(),
                             vec![lsp::TextEdit::new(
                                 lsp::Range::new(lsp::Position::new(0, 6), lsp::Position::new(0, 9)),
                                 "THREE".to_string(),
                             )],
                         ),
                         (
-                            lsp::Uri::from_file_path("/dir/two.rs").unwrap().into(),
+                            lsp::Url::from_file_path("/dir/two.rs").unwrap(),
                             vec![
                                 lsp::TextEdit::new(
                                     lsp::Range::new(
@@ -980,7 +982,7 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
     cx_b.update(editor::init);
 
     client_a.language_registry().add(rust_lang());
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             name: "the-language-server",
@@ -1006,6 +1008,8 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
 
     let fake_language_server = fake_language_servers.next().await.unwrap();
     fake_language_server.start_progress("the-token").await;
+
+    executor.advance_clock(SERVER_PROGRESS_THROTTLE_TIMEOUT);
     fake_language_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
         token: lsp::NumberOrString::String("the-token".to_string()),
         value: lsp::ProgressParamsValue::WorkDone(lsp::WorkDoneProgress::Report(
@@ -1015,11 +1019,10 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
             },
         )),
     });
-    executor.advance_clock(SERVER_PROGRESS_DEBOUNCE_TIMEOUT);
     executor.run_until_parked();
 
-    project_a.read_with(cx_a, |project, _| {
-        let status = project.language_server_statuses().next().unwrap();
+    project_a.read_with(cx_a, |project, cx| {
+        let status = project.language_server_statuses(cx).next().unwrap().1;
         assert_eq!(status.name, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
@@ -1035,11 +1038,12 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
     executor.run_until_parked();
     let project_b = client_b.build_dev_server_project(project_id, cx_b).await;
 
-    project_b.read_with(cx_b, |project, _| {
-        let status = project.language_server_statuses().next().unwrap();
+    project_b.read_with(cx_b, |project, cx| {
+        let status = project.language_server_statuses(cx).next().unwrap().1;
         assert_eq!(status.name, "the-language-server");
     });
 
+    executor.advance_clock(SERVER_PROGRESS_THROTTLE_TIMEOUT);
     fake_language_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
         token: lsp::NumberOrString::String("the-token".to_string()),
         value: lsp::ProgressParamsValue::WorkDone(lsp::WorkDoneProgress::Report(
@@ -1049,11 +1053,10 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
             },
         )),
     });
-    executor.advance_clock(SERVER_PROGRESS_DEBOUNCE_TIMEOUT);
     executor.run_until_parked();
 
-    project_a.read_with(cx_a, |project, _| {
-        let status = project.language_server_statuses().next().unwrap();
+    project_a.read_with(cx_a, |project, cx| {
+        let status = project.language_server_statuses(cx).next().unwrap().1;
         assert_eq!(status.name, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
@@ -1062,8 +1065,8 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
         );
     });
 
-    project_b.read_with(cx_b, |project, _| {
-        let status = project.language_server_statuses().next().unwrap();
+    project_b.read_with(cx_b, |project, cx| {
+        let status = project.language_server_statuses(cx).next().unwrap().1;
         assert_eq!(status.name, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
@@ -1143,7 +1146,7 @@ async fn test_share_project(
     });
 
     project_b.read_with(cx_b, |project, cx| {
-        let worktree = project.worktrees().next().unwrap().read(cx);
+        let worktree = project.worktrees(cx).next().unwrap().read(cx);
         assert_eq!(
             worktree.paths().map(AsRef::as_ref).collect::<Vec<_>>(),
             [
@@ -1157,7 +1160,7 @@ async fn test_share_project(
 
     project_b
         .update(cx_b, |project, cx| {
-            let worktree = project.worktrees().next().unwrap();
+            let worktree = project.worktrees(cx).next().unwrap();
             let entry = worktree.read(cx).entry_for_path("ignored-dir").unwrap();
             project.expand_entry(worktree_id, entry.id, cx).unwrap()
         })
@@ -1165,7 +1168,7 @@ async fn test_share_project(
         .unwrap();
 
     project_b.read_with(cx_b, |project, cx| {
-        let worktree = project.worktrees().next().unwrap().read(cx);
+        let worktree = project.worktrees(cx).next().unwrap().read(cx);
         assert_eq!(
             worktree.paths().map(AsRef::as_ref).collect::<Vec<_>>(),
             [
@@ -1203,7 +1206,7 @@ async fn test_share_project(
     buffer_a.read_with(cx_a, |buffer, _| {
         buffer
             .snapshot()
-            .remote_selections_in_range(text::Anchor::MIN..text::Anchor::MAX)
+            .selections_in_range(text::Anchor::MIN..text::Anchor::MAX, false)
             .count()
             == 1
     });
@@ -1244,7 +1247,7 @@ async fn test_share_project(
     buffer_a.read_with(cx_a, |buffer, _| {
         buffer
             .snapshot()
-            .remote_selections_in_range(text::Anchor::MIN..text::Anchor::MAX)
+            .selections_in_range(text::Anchor::MIN..text::Anchor::MAX, false)
             .count()
             == 0
     });
@@ -1265,7 +1268,7 @@ async fn test_on_input_format_from_host_to_guest(
     let active_call_a = cx_a.read(ActiveCall::global);
 
     client_a.language_registry().add(rust_lang());
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             capabilities: lsp::ServerCapabilities {
@@ -1313,7 +1316,7 @@ async fn test_on_input_format_from_host_to_guest(
         |params, _| async move {
             assert_eq!(
                 params.text_document_position.text_document.uri,
-                lsp::Uri::from_file_path("/a/main.rs").unwrap().into(),
+                lsp::Url::from_file_path("/a/main.rs").unwrap(),
             );
             assert_eq!(
                 params.text_document_position.position,
@@ -1385,7 +1388,7 @@ async fn test_on_input_format_from_guest_to_host(
     let active_call_a = cx_a.read(ActiveCall::global);
 
     client_a.language_registry().add(rust_lang());
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             capabilities: lsp::ServerCapabilities {
@@ -1441,7 +1444,7 @@ async fn test_on_input_format_from_guest_to_host(
         .handle_request::<lsp::request::OnTypeFormatting, _, _>(|params, _| async move {
             assert_eq!(
                 params.text_document_position.text_document.uri,
-                lsp::Uri::from_file_path("/a/main.rs").unwrap().into(),
+                lsp::Url::from_file_path("/a/main.rs").unwrap(),
             );
             assert_eq!(
                 params.text_document_position.position,
@@ -1521,6 +1524,7 @@ async fn test_mutual_editor_inlay_hint_cache_update(
                     show_type_hints: true,
                     show_parameter_hints: false,
                     show_other_hints: true,
+                    show_background: false,
                 })
             });
         });
@@ -1535,6 +1539,7 @@ async fn test_mutual_editor_inlay_hint_cache_update(
                     show_type_hints: true,
                     show_parameter_hints: false,
                     show_other_hints: true,
+                    show_background: false,
                 })
             });
         });
@@ -1542,7 +1547,7 @@ async fn test_mutual_editor_inlay_hint_cache_update(
 
     client_a.language_registry().add(rust_lang());
     client_b.language_registry().add(rust_lang());
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             capabilities: lsp::ServerCapabilities {
@@ -1610,7 +1615,7 @@ async fn test_mutual_editor_inlay_hint_cache_update(
             async move {
                 assert_eq!(
                     params.text_document.uri,
-                    lsp::Uri::from_file_path("/a/main.rs").unwrap().into(),
+                    lsp::Url::from_file_path("/a/main.rs").unwrap(),
                 );
                 let edits_made = task_edits_made.load(atomic::Ordering::Acquire);
                 Ok(Some(vec![lsp::InlayHint {
@@ -1783,6 +1788,7 @@ async fn test_inlay_hint_refresh_is_forwarded(
                     show_type_hints: false,
                     show_parameter_hints: false,
                     show_other_hints: false,
+                    show_background: false,
                 })
             });
         });
@@ -1797,6 +1803,7 @@ async fn test_inlay_hint_refresh_is_forwarded(
                     show_type_hints: true,
                     show_parameter_hints: true,
                     show_other_hints: true,
+                    show_background: false,
                 })
             });
         });
@@ -1804,7 +1811,7 @@ async fn test_inlay_hint_refresh_is_forwarded(
 
     client_a.language_registry().add(rust_lang());
     client_b.language_registry().add(rust_lang());
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             capabilities: lsp::ServerCapabilities {
@@ -1873,7 +1880,7 @@ async fn test_inlay_hint_refresh_is_forwarded(
             async move {
                 assert_eq!(
                     params.text_document.uri,
-                    lsp::Uri::from_file_path("/a/main.rs").unwrap().into(),
+                    lsp::Url::from_file_path("/a/main.rs").unwrap(),
                 );
                 let other_hints = task_other_hints.load(atomic::Ordering::Acquire);
                 let character = if other_hints { 0 } else { 2 };
@@ -2106,7 +2113,7 @@ struct Row10;"#};
     editor_cx_a.update_editor(|editor, cx| {
         let snapshot = editor.snapshot(cx);
         let all_hunks = editor_hunks(editor, &snapshot, cx);
-        let all_expanded_hunks = expanded_hunks(&editor, &snapshot, cx);
+        let all_expanded_hunks = expanded_hunks(editor, &snapshot, cx);
         assert_eq!(expanded_hunks_background_highlights(editor, cx), Vec::new());
         assert_eq!(
             all_hunks,
@@ -2143,7 +2150,7 @@ struct Row10;"#};
     editor_cx_b.update_editor(|editor, cx| {
         let snapshot = editor.snapshot(cx);
         let all_hunks = editor_hunks(editor, &snapshot, cx);
-        let all_expanded_hunks = expanded_hunks(&editor, &snapshot, cx);
+        let all_expanded_hunks = expanded_hunks(editor, &snapshot, cx);
         assert_eq!(
             expanded_hunks_background_highlights(editor, cx),
             vec![DisplayRow(1)..=DisplayRow(2), DisplayRow(8)..=DisplayRow(8)],
@@ -2191,7 +2198,7 @@ struct Row10;"#};
     editor_cx_a.update_editor(|editor, cx| {
         let snapshot = editor.snapshot(cx);
         let all_hunks = editor_hunks(editor, &snapshot, cx);
-        let all_expanded_hunks = expanded_hunks(&editor, &snapshot, cx);
+        let all_expanded_hunks = expanded_hunks(editor, &snapshot, cx);
         assert_eq!(expanded_hunks_background_highlights(editor, cx), Vec::new());
         assert_eq!(
             all_hunks,
@@ -2206,7 +2213,7 @@ struct Row10;"#};
     editor_cx_b.update_editor(|editor, cx| {
         let snapshot = editor.snapshot(cx);
         let all_hunks = editor_hunks(editor, &snapshot, cx);
-        let all_expanded_hunks = expanded_hunks(&editor, &snapshot, cx);
+        let all_expanded_hunks = expanded_hunks(editor, &snapshot, cx);
         assert_eq!(
             expanded_hunks_background_highlights(editor, cx),
             vec![DisplayRow(5)..=DisplayRow(5)]

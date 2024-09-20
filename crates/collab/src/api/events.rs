@@ -1,4 +1,6 @@
 use super::ips_file::IpsFile;
+use crate::api::CloudflareIpCountryHeader;
+use crate::clickhouse::write_to_table;
 use crate::{api::slack, AppState, Error, Result};
 use anyhow::{anyhow, Context};
 use aws_sdk_s3::primitives::ByteStream;
@@ -16,8 +18,8 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
 use telemetry_events::{
     ActionEvent, AppEvent, AssistantEvent, CallEvent, CpuEvent, EditEvent, EditorEvent, Event,
-    EventRequestBody, EventWrapper, ExtensionEvent, InlineCompletionEvent, MemoryEvent,
-    SettingEvent,
+    EventRequestBody, EventWrapper, ExtensionEvent, InlineCompletionEvent, MemoryEvent, Panic,
+    ReplEvent, SettingEvent,
 };
 use uuid::Uuid;
 
@@ -52,33 +54,6 @@ impl Header for ZedChecksumHeader {
 
         let bytes = hex::decode(checksum).map_err(|_| axum::headers::Error::invalid())?;
         Ok(Self(bytes))
-    }
-
-    fn encode<E: Extend<axum::http::HeaderValue>>(&self, _values: &mut E) {
-        unimplemented!()
-    }
-}
-
-pub struct CloudflareIpCountryHeader(String);
-
-impl Header for CloudflareIpCountryHeader {
-    fn name() -> &'static HeaderName {
-        static CLOUDFLARE_IP_COUNTRY_HEADER: OnceLock<HeaderName> = OnceLock::new();
-        CLOUDFLARE_IP_COUNTRY_HEADER.get_or_init(|| HeaderName::from_static("cf-ipcountry"))
-    }
-
-    fn decode<'i, I>(values: &mut I) -> Result<Self, axum::headers::Error>
-    where
-        Self: Sized,
-        I: Iterator<Item = &'i axum::http::HeaderValue>,
-    {
-        let country_code = values
-            .next()
-            .ok_or_else(axum::headers::Error::invalid)?
-            .to_str()
-            .map_err(|_| axum::headers::Error::invalid())?;
-
-        Ok(Self(country_code.to_string()))
     }
 
     fn encode<E: Extend<axum::http::HeaderValue>>(&self, _values: &mut E) {
@@ -174,7 +149,8 @@ pub async fn post_crash(
         installation_id = %installation_id,
         description = %description,
         backtrace = %summary,
-        "crash report");
+        "crash report"
+    );
 
     if let Some(slack_panics_webhook) = app.config.slack_panics_webhook.clone() {
         let payload = slack::WebhookBody::new(|w| {
@@ -232,14 +208,14 @@ pub async fn post_hang(
     body: Bytes,
 ) -> Result<()> {
     let Some(expected) = calculate_json_checksum(app.clone(), &body) else {
-        return Err(Error::Http(
+        return Err(Error::http(
             StatusCode::INTERNAL_SERVER_ERROR,
             "events not enabled".into(),
         ))?;
     };
 
     if checksum != expected {
-        return Err(Error::Http(
+        return Err(Error::http(
             StatusCode::BAD_REQUEST,
             "invalid checksum".into(),
         ))?;
@@ -291,40 +267,40 @@ pub async fn post_panic(
     body: Bytes,
 ) -> Result<()> {
     let Some(expected) = calculate_json_checksum(app.clone(), &body) else {
-        return Err(Error::Http(
+        return Err(Error::http(
             StatusCode::INTERNAL_SERVER_ERROR,
             "events not enabled".into(),
         ))?;
     };
 
     if checksum != expected {
-        return Err(Error::Http(
+        return Err(Error::http(
             StatusCode::BAD_REQUEST,
             "invalid checksum".into(),
         ))?;
     }
 
     let report: telemetry_events::PanicRequest = serde_json::from_slice(&body)
-        .map_err(|_| Error::Http(StatusCode::BAD_REQUEST, "invalid json".into()))?;
+        .map_err(|_| Error::http(StatusCode::BAD_REQUEST, "invalid json".into()))?;
     let panic = report.panic;
 
-    // better OS reporting for linux (because linux is hard):
-    // - Remove os_version/app_version/os_name from the gpui platform trait
-    // - Move platform processing data into client/telemetry
-    // - Duplicate some small code in macOS platform for a version check
-    // - Add GPUI API for reporting the selected platform integration
-    //  - macos-blade, macos-metal, linux-X11, linux-headless
-    // if cfg(macos( { "Macos" } else { "Linux-{cx.compositor_name()"} ))
+    if panic.os_name == "Linux" && panic.os_version == Some("1.0.0".to_string()) {
+        return Err(Error::http(
+            StatusCode::BAD_REQUEST,
+            "invalid os version".into(),
+        ))?;
+    }
 
     tracing::error!(
         service = "client",
         version = %panic.app_version,
         os_name = %panic.os_name,
         os_version = %panic.os_version.clone().unwrap_or_default(),
-        installation_id = %panic.installation_id.unwrap_or_default(),
+        installation_id = %panic.installation_id.clone().unwrap_or_default(),
         description = %panic.payload,
         backtrace = %panic.backtrace.join("\n"),
-        "panic report");
+        "panic report"
+    );
 
     let backtrace = if panic.backtrace.len() > 25 {
         let total = panic.backtrace.len();
@@ -342,6 +318,11 @@ pub async fn post_panic(
     } else {
         panic.backtrace.join("\n")
     };
+
+    if !report_to_slack(&panic) {
+        return Ok(());
+    }
+
     let backtrace_with_summary = panic.payload + "\n" + &backtrace;
 
     if let Some(slack_panics_webhook) = app.config.slack_panics_webhook.clone() {
@@ -382,6 +363,23 @@ pub async fn post_panic(
     Ok(())
 }
 
+fn report_to_slack(panic: &Panic) -> bool {
+    if panic.os_name == "Linux" {
+        if panic.payload.contains("ERROR_SURFACE_LOST_KHR") {
+            return false;
+        }
+
+        if panic
+            .payload
+            .contains("GPU has crashed, and no debug information is available")
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 pub async fn post_events(
     Extension(app): Extension<Arc<AppState>>,
     TypedHeader(ZedChecksumHeader(checksum)): TypedHeader<ZedChecksumHeader>,
@@ -389,14 +387,14 @@ pub async fn post_events(
     body: Bytes,
 ) -> Result<()> {
     let Some(clickhouse_client) = app.clickhouse_client.clone() else {
-        Err(Error::Http(
+        Err(Error::http(
             StatusCode::NOT_IMPLEMENTED,
             "not supported".into(),
         ))?
     };
 
     let Some(expected) = calculate_json_checksum(app.clone(), &body) else {
-        return Err(Error::Http(
+        return Err(Error::http(
             StatusCode::INTERNAL_SERVER_ERROR,
             "events not enabled".into(),
         ))?;
@@ -412,9 +410,9 @@ pub async fn post_events(
 
     let mut to_upload = ToUpload::default();
     let Some(last_event) = request_body.events.last() else {
-        return Err(Error::Http(StatusCode::BAD_REQUEST, "no events".into()))?;
+        return Err(Error::http(StatusCode::BAD_REQUEST, "no events".into()))?;
     };
-    let country_code = country_code_header.map(|h| h.0 .0);
+    let country_code = country_code_header.map(|h| h.to_string());
 
     let first_event_at = chrono::Utc::now()
         - chrono::Duration::milliseconds(last_event.milliseconds_since_first_event);
@@ -423,7 +421,7 @@ pub async fn post_events(
         match &wrapper.event {
             Event::Editor(event) => to_upload.editor_events.push(EditorEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 country_code.clone(),
@@ -436,7 +434,7 @@ pub async fn post_events(
                     .inline_completion_events
                     .push(InlineCompletionEventRow::from_event(
                         event.clone(),
-                        &wrapper,
+                        wrapper,
                         &request_body,
                         first_event_at,
                         country_code.clone(),
@@ -445,7 +443,7 @@ pub async fn post_events(
             }
             Event::Call(event) => to_upload.call_events.push(CallEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
@@ -455,7 +453,7 @@ pub async fn post_events(
                     .assistant_events
                     .push(AssistantEventRow::from_event(
                         event.clone(),
-                        &wrapper,
+                        wrapper,
                         &request_body,
                         first_event_at,
                         checksum_matched,
@@ -463,42 +461,42 @@ pub async fn post_events(
             }
             Event::Cpu(event) => to_upload.cpu_events.push(CpuEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Memory(event) => to_upload.memory_events.push(MemoryEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::App(event) => to_upload.app_events.push(AppEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Setting(event) => to_upload.setting_events.push(SettingEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Edit(event) => to_upload.edit_events.push(EditEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Action(event) => to_upload.action_events.push(ActionEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
@@ -512,13 +510,20 @@ pub async fn post_events(
                     .extension_events
                     .push(ExtensionEventRow::from_event(
                         event.clone(),
-                        &wrapper,
+                        wrapper,
                         &request_body,
                         metadata,
                         first_event_at,
                         checksum_matched,
                     ))
             }
+            Event::Repl(event) => to_upload.repl_events.push(ReplEventRow::from_event(
+                event.clone(),
+                wrapper,
+                &request_body,
+                first_event_at,
+                checksum_matched,
+            )),
         }
     }
 
@@ -543,17 +548,18 @@ struct ToUpload {
     extension_events: Vec<ExtensionEventRow>,
     edit_events: Vec<EditEventRow>,
     action_events: Vec<ActionEventRow>,
+    repl_events: Vec<ReplEventRow>,
 }
 
 impl ToUpload {
     pub async fn upload(&self, clickhouse_client: &clickhouse::Client) -> anyhow::Result<()> {
         const EDITOR_EVENTS_TABLE: &str = "editor_events";
-        Self::upload_to_table(EDITOR_EVENTS_TABLE, &self.editor_events, clickhouse_client)
+        write_to_table(EDITOR_EVENTS_TABLE, &self.editor_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{EDITOR_EVENTS_TABLE}'"))?;
 
         const INLINE_COMPLETION_EVENTS_TABLE: &str = "inline_completion_events";
-        Self::upload_to_table(
+        write_to_table(
             INLINE_COMPLETION_EVENTS_TABLE,
             &self.inline_completion_events,
             clickhouse_client,
@@ -562,7 +568,7 @@ impl ToUpload {
         .with_context(|| format!("failed to upload to table '{INLINE_COMPLETION_EVENTS_TABLE}'"))?;
 
         const ASSISTANT_EVENTS_TABLE: &str = "assistant_events";
-        Self::upload_to_table(
+        write_to_table(
             ASSISTANT_EVENTS_TABLE,
             &self.assistant_events,
             clickhouse_client,
@@ -571,27 +577,27 @@ impl ToUpload {
         .with_context(|| format!("failed to upload to table '{ASSISTANT_EVENTS_TABLE}'"))?;
 
         const CALL_EVENTS_TABLE: &str = "call_events";
-        Self::upload_to_table(CALL_EVENTS_TABLE, &self.call_events, clickhouse_client)
+        write_to_table(CALL_EVENTS_TABLE, &self.call_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{CALL_EVENTS_TABLE}'"))?;
 
         const CPU_EVENTS_TABLE: &str = "cpu_events";
-        Self::upload_to_table(CPU_EVENTS_TABLE, &self.cpu_events, clickhouse_client)
+        write_to_table(CPU_EVENTS_TABLE, &self.cpu_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{CPU_EVENTS_TABLE}'"))?;
 
         const MEMORY_EVENTS_TABLE: &str = "memory_events";
-        Self::upload_to_table(MEMORY_EVENTS_TABLE, &self.memory_events, clickhouse_client)
+        write_to_table(MEMORY_EVENTS_TABLE, &self.memory_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{MEMORY_EVENTS_TABLE}'"))?;
 
         const APP_EVENTS_TABLE: &str = "app_events";
-        Self::upload_to_table(APP_EVENTS_TABLE, &self.app_events, clickhouse_client)
+        write_to_table(APP_EVENTS_TABLE, &self.app_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{APP_EVENTS_TABLE}'"))?;
 
         const SETTING_EVENTS_TABLE: &str = "setting_events";
-        Self::upload_to_table(
+        write_to_table(
             SETTING_EVENTS_TABLE,
             &self.setting_events,
             clickhouse_client,
@@ -600,7 +606,7 @@ impl ToUpload {
         .with_context(|| format!("failed to upload to table '{SETTING_EVENTS_TABLE}'"))?;
 
         const EXTENSION_EVENTS_TABLE: &str = "extension_events";
-        Self::upload_to_table(
+        write_to_table(
             EXTENSION_EVENTS_TABLE,
             &self.extension_events,
             clickhouse_client,
@@ -609,38 +615,19 @@ impl ToUpload {
         .with_context(|| format!("failed to upload to table '{EXTENSION_EVENTS_TABLE}'"))?;
 
         const EDIT_EVENTS_TABLE: &str = "edit_events";
-        Self::upload_to_table(EDIT_EVENTS_TABLE, &self.edit_events, clickhouse_client)
+        write_to_table(EDIT_EVENTS_TABLE, &self.edit_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{EDIT_EVENTS_TABLE}'"))?;
 
         const ACTION_EVENTS_TABLE: &str = "action_events";
-        Self::upload_to_table(ACTION_EVENTS_TABLE, &self.action_events, clickhouse_client)
+        write_to_table(ACTION_EVENTS_TABLE, &self.action_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{ACTION_EVENTS_TABLE}'"))?;
 
-        Ok(())
-    }
-
-    async fn upload_to_table<T: clickhouse::Row + Serialize + std::fmt::Debug>(
-        table: &str,
-        rows: &[T],
-        clickhouse_client: &clickhouse::Client,
-    ) -> anyhow::Result<()> {
-        if !rows.is_empty() {
-            let mut insert = clickhouse_client.insert(table)?;
-
-            for event in rows {
-                insert.write(event).await?;
-            }
-
-            insert.end().await?;
-
-            let event_count = rows.len();
-            log::info!(
-                "wrote {event_count} {event_specifier} to '{table}'",
-                event_specifier = if event_count == 1 { "event" } else { "events" }
-            );
-        }
+        const REPL_EVENTS_TABLE: &str = "repl_events";
+        write_to_table(REPL_EVENTS_TABLE, &self.repl_events, clickhouse_client)
+            .await
+            .with_context(|| format!("failed to upload to table '{REPL_EVENTS_TABLE}'"))?;
 
         Ok(())
     }
@@ -664,7 +651,10 @@ where
 
 #[derive(Serialize, Debug, clickhouse::Row)]
 pub struct EditorEventRow {
+    system_id: String,
     installation_id: String,
+    session_id: Option<String>,
+    metrics_id: String,
     operation: String,
     app_version: String,
     file_extension: String,
@@ -683,7 +673,6 @@ pub struct EditorEventRow {
     historical_event: bool,
     architecture: String,
     is_staff: Option<bool>,
-    session_id: Option<String>,
     major: Option<i32>,
     minor: Option<i32>,
     patch: Option<i32>,
@@ -713,8 +702,10 @@ impl EditorEventRow {
             os_name: body.os_name.clone(),
             os_version: body.os_version.clone().unwrap_or_default(),
             architecture: body.architecture.clone(),
+            system_id: body.system_id.clone().unwrap_or_default(),
             installation_id: body.installation_id.clone().unwrap_or_default(),
             session_id: body.session_id.clone(),
+            metrics_id: body.metrics_id.clone().unwrap_or_default(),
             is_staff: body.is_staff,
             time: time.timestamp_millis(),
             operation: event.operation,
@@ -734,6 +725,7 @@ impl EditorEventRow {
 #[derive(Serialize, Debug, clickhouse::Row)]
 pub struct InlineCompletionEventRow {
     installation_id: String,
+    session_id: Option<String>,
     provider: String,
     suggestion_accepted: bool,
     app_version: String,
@@ -748,7 +740,6 @@ pub struct InlineCompletionEventRow {
     city: String,
     time: i64,
     is_staff: Option<bool>,
-    session_id: Option<String>,
     major: Option<i32>,
     minor: Option<i32>,
     patch: Option<i32>,
@@ -869,6 +860,7 @@ pub struct AssistantEventRow {
     // AssistantEventRow
     conversation_id: String,
     kind: String,
+    phase: String,
     model: String,
     response_latency_in_ms: Option<i64>,
     error_message: Option<String>,
@@ -901,6 +893,7 @@ impl AssistantEventRow {
             time: time.timestamp_millis(),
             conversation_id: event.conversation_id.unwrap_or_default(),
             kind: event.kind.to_string(),
+            phase: event.phase.to_string(),
             model: event.model,
             response_latency_in_ms: event
                 .response_latency
@@ -913,6 +906,7 @@ impl AssistantEventRow {
 #[derive(Debug, clickhouse::Row, Serialize)]
 pub struct CpuEventRow {
     installation_id: Option<String>,
+    session_id: Option<String>,
     is_staff: Option<bool>,
     usage_as_percentage: f32,
     core_count: u32,
@@ -921,7 +915,6 @@ pub struct CpuEventRow {
     os_name: String,
     os_version: String,
     time: i64,
-    session_id: Option<String>,
     // pub normalized_cpu_usage: f64, MATERIALIZED
     major: Option<i32>,
     minor: Option<i32>,
@@ -1189,6 +1182,62 @@ impl ExtensionEventRow {
 }
 
 #[derive(Serialize, Debug, clickhouse::Row)]
+pub struct ReplEventRow {
+    // AppInfoBase
+    app_version: String,
+    major: Option<i32>,
+    minor: Option<i32>,
+    patch: Option<i32>,
+    checksum_matched: bool,
+    release_channel: String,
+    os_name: String,
+    os_version: String,
+
+    // ClientEventBase
+    installation_id: Option<String>,
+    session_id: Option<String>,
+    is_staff: Option<bool>,
+    time: i64,
+
+    // ReplEventRow
+    kernel_language: String,
+    kernel_status: String,
+    repl_session_id: String,
+}
+
+impl ReplEventRow {
+    fn from_event(
+        event: ReplEvent,
+        wrapper: &EventWrapper,
+        body: &EventRequestBody,
+        first_event_at: chrono::DateTime<chrono::Utc>,
+        checksum_matched: bool,
+    ) -> Self {
+        let semver = body.semver();
+        let time =
+            first_event_at + chrono::Duration::milliseconds(wrapper.milliseconds_since_first_event);
+
+        Self {
+            app_version: body.app_version.clone(),
+            major: semver.map(|v| v.major() as i32),
+            minor: semver.map(|v| v.minor() as i32),
+            patch: semver.map(|v| v.patch() as i32),
+            checksum_matched,
+            release_channel: body.release_channel.clone().unwrap_or_default(),
+            os_name: body.os_name.clone(),
+            os_version: body.os_version.clone().unwrap_or_default(),
+            installation_id: body.installation_id.clone(),
+            session_id: body.session_id.clone(),
+            is_staff: body.is_staff,
+            time: time.timestamp_millis(),
+            kernel_language: event.kernel_language,
+            kernel_status: event.kernel_status,
+            repl_session_id: event.repl_session_id,
+        }
+    }
+}
+
+#[derive(Serialize, Debug, clickhouse::Row)]
 pub struct EditEventRow {
     // AppInfoBase
     app_version: String,
@@ -1305,13 +1354,11 @@ impl ActionEventRow {
 }
 
 pub fn calculate_json_checksum(app: Arc<AppState>, json: &impl AsRef<[u8]>) -> Option<Vec<u8>> {
-    let Some(checksum_seed) = app.config.zed_client_checksum_seed.as_ref() else {
-        return None;
-    };
+    let checksum_seed = app.config.zed_client_checksum_seed.as_ref()?;
 
     let mut summer = Sha256::new();
     summer.update(checksum_seed);
-    summer.update(&json);
+    summer.update(json);
     summer.update(checksum_seed);
     Some(summer.finalize().into_iter().collect())
 }

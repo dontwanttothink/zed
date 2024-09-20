@@ -17,14 +17,13 @@ test-support = ["async-pipe"]
 
 [dependencies]
 anyhow.workspace = true
-async-pipe = { git = "https://github.com/zed-industries/async-pipe-rs", rev = "82d00a04211cf4e1236029aa03e6b6ce2a74c553", optional = true }
+async-pipe = { workspace = true, optional = true }
 collections.workspace = true
 futures.workspace = true
 gpui.workspace = true
 log.workspace = true
-lsp-types = { git = "https://github.com/zed-industries/lsp-types", branch = "zed-main" }
+lsp-types = { git = "https://github.com/zed-industries/lsp-types", rev = "72357d6f6d212bdffba3b5ef4b31d8ca856058e7" }
 parking_lot.workspace = true
-pct-str = "2.0"
 postage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -36,7 +35,7 @@ release_channel.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
-async-pipe = { git = "https://github.com/zed-industries/async-pipe-rs", rev = "82d00a04211cf4e1236029aa03e6b6ce2a74c553" }
+async-pipe.workspace = true
 ctor.workspace = true
 env_logger.workspace = true
 gpui = { workspace = true, features = ["test-support"] }

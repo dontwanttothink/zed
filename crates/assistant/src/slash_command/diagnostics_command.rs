@@ -1,27 +1,27 @@
-use super::{SlashCommand, SlashCommandOutput};
+use super::{create_label_for_command, SlashCommand, SlashCommandOutput};
 use anyhow::{anyhow, Result};
-use assistant_slash_command::SlashCommandOutputSection;
+use assistant_slash_command::{ArgumentCompletion, SlashCommandOutputSection};
 use fuzzy::{PathMatch, StringMatchCandidate};
-use gpui::{svg, AppContext, Model, RenderOnce, Task, View, WeakView};
+use gpui::{AppContext, Model, Task, View, WeakView};
 use language::{
     Anchor, BufferSnapshot, DiagnosticEntry, DiagnosticSeverity, LspAdapterDelegate,
     OffsetRangeExt, ToOffset,
 };
 use project::{DiagnosticSummary, PathMatchCandidateSet, Project};
 use rope::Point;
-use std::fmt::Write;
 use std::{
-    ops::Range,
+    fmt::Write,
+    path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
 };
-use ui::{prelude::*, ButtonLike, ElevationIndex};
+use ui::prelude::*;
 use util::paths::PathMatcher;
 use util::ResultExt;
 use workspace::Workspace;
 
-pub(crate) struct DiagnosticsCommand;
+pub(crate) struct DiagnosticsSlashCommand;
 
-impl DiagnosticsCommand {
+impl DiagnosticsSlashCommand {
     fn search_paths(
         &self,
         query: String,
@@ -32,7 +32,7 @@ impl DiagnosticsCommand {
         if query.is_empty() {
             let workspace = workspace.read(cx);
             let entries = workspace.recent_navigation_history(Some(10), cx);
-            let path_prefix: Arc<str> = "".into();
+            let path_prefix: Arc<str> = Arc::default();
             Task::ready(
                 entries
                     .into_iter()
@@ -42,6 +42,7 @@ impl DiagnosticsCommand {
                         worktree_id: entry.worktree_id.to_usize(),
                         path: entry.path.clone(),
                         path_prefix: path_prefix.clone(),
+                        is_dir: false, // Diagnostics can't be produced for directories
                         distance_to_relative_ancestor: 0,
                     })
                     .collect(),
@@ -57,7 +58,7 @@ impl DiagnosticsCommand {
                         include_ignored: worktree
                             .root_entry()
                             .map_or(false, |entry| entry.is_ignored),
-                        include_root_name: false,
+                        include_root_name: true,
                         candidates: project::Candidates::Entries,
                     }
                 })
@@ -80,9 +81,13 @@ impl DiagnosticsCommand {
     }
 }
 
-impl SlashCommand for DiagnosticsCommand {
+impl SlashCommand for DiagnosticsSlashCommand {
     fn name(&self) -> String {
         "diagnostics".into()
+    }
+
+    fn label(&self, cx: &AppContext) -> language::CodeLabel {
+        create_label_for_command("diagnostics", &[INCLUDE_WARNINGS_ARGUMENT], cx)
     }
 
     fn description(&self) -> String {
@@ -97,17 +102,21 @@ impl SlashCommand for DiagnosticsCommand {
         false
     }
 
+    fn accepts_arguments(&self) -> bool {
+        true
+    }
+
     fn complete_argument(
-        &self,
-        query: String,
+        self: Arc<Self>,
+        arguments: &[String],
         cancellation_flag: Arc<AtomicBool>,
         workspace: Option<WeakView<Workspace>>,
-        cx: &mut AppContext,
-    ) -> Task<Result<Vec<String>>> {
+        cx: &mut WindowContext,
+    ) -> Task<Result<Vec<ArgumentCompletion>>> {
         let Some(workspace) = workspace.and_then(|workspace| workspace.upgrade()) else {
             return Task::ready(Err(anyhow!("workspace was dropped")));
         };
-        let query = query.split_whitespace().last().unwrap_or("").to_string();
+        let query = arguments.last().cloned().unwrap_or_default();
 
         let paths = self.search_paths(query.clone(), cancellation_flag.clone(), &workspace, cx);
         let executor = cx.background_executor().clone();
@@ -138,45 +147,36 @@ impl SlashCommand for DiagnosticsCommand {
                 .map(|candidate| candidate.string),
             );
 
-            Ok(matches)
+            Ok(matches
+                .into_iter()
+                .map(|completion| ArgumentCompletion {
+                    label: completion.clone().into(),
+                    new_text: completion,
+                    after_completion: assistant_slash_command::AfterCompletion::Run,
+                    replace_previous_arguments: false,
+                })
+                .collect())
         })
     }
 
     fn run(
         self: Arc<Self>,
-        argument: Option<&str>,
+        arguments: &[String],
+        _context_slash_command_output_sections: &[SlashCommandOutputSection<language::Anchor>],
+        _context_buffer: BufferSnapshot,
         workspace: WeakView<Workspace>,
-        _delegate: Arc<dyn LspAdapterDelegate>,
+        _delegate: Option<Arc<dyn LspAdapterDelegate>>,
         cx: &mut WindowContext,
     ) -> Task<Result<SlashCommandOutput>> {
         let Some(workspace) = workspace.upgrade() else {
             return Task::ready(Err(anyhow!("workspace was dropped")));
         };
 
-        let options = Options::parse(argument);
+        let options = Options::parse(arguments);
 
         let task = collect_diagnostics(workspace.read(cx).project().clone(), options, cx);
-        cx.spawn(move |_| async move {
-            let (text, sections) = task.await?;
-            Ok(SlashCommandOutput {
-                text,
-                sections: sections
-                    .into_iter()
-                    .map(|(range, placeholder_type)| SlashCommandOutputSection {
-                        range,
-                        render_placeholder: Arc::new(move |id, unfold, _cx| {
-                            DiagnosticsPlaceholder {
-                                id,
-                                unfold,
-                                placeholder_type: placeholder_type.clone(),
-                            }
-                            .into_any_element()
-                        }),
-                    })
-                    .collect(),
-                run_commands_in_text: false,
-            })
-        })
+
+        cx.spawn(move |_| async move { task.await?.ok_or_else(|| anyhow!("No diagnostics found")) })
     }
 }
 
@@ -189,25 +189,20 @@ struct Options {
 const INCLUDE_WARNINGS_ARGUMENT: &str = "--include-warnings";
 
 impl Options {
-    pub fn parse(arguments_line: Option<&str>) -> Self {
-        arguments_line
-            .map(|arguments_line| {
-                let args = arguments_line.split_whitespace().collect::<Vec<_>>();
-                let mut include_warnings = false;
-                let mut path_matcher = None;
-                for arg in args {
-                    if arg == INCLUDE_WARNINGS_ARGUMENT {
-                        include_warnings = true;
-                    } else {
-                        path_matcher = PathMatcher::new(arg).log_err();
-                    }
-                }
-                Self {
-                    include_warnings,
-                    path_matcher,
-                }
-            })
-            .unwrap_or_default()
+    fn parse(arguments: &[String]) -> Self {
+        let mut include_warnings = false;
+        let mut path_matcher = None;
+        for arg in arguments {
+            if arg == INCLUDE_WARNINGS_ARGUMENT {
+                include_warnings = true;
+            } else {
+                path_matcher = PathMatcher::new(&[arg.to_owned()]).log_err();
+            }
+        }
+        Self {
+            include_warnings,
+            path_matcher,
+        }
     }
 
     fn match_candidates_for_args() -> [StringMatchCandidate; 1] {
@@ -222,25 +217,59 @@ fn collect_diagnostics(
     project: Model<Project>,
     options: Options,
     cx: &mut AppContext,
-) -> Task<Result<(String, Vec<(Range<usize>, PlaceholderType)>)>> {
-    let header = if let Some(path_matcher) = &options.path_matcher {
-        format!("diagnostics: {}", path_matcher.source())
+) -> Task<Result<Option<SlashCommandOutput>>> {
+    let error_source = if let Some(path_matcher) = &options.path_matcher {
+        debug_assert_eq!(path_matcher.sources().len(), 1);
+        Some(path_matcher.sources().first().cloned().unwrap_or_default())
     } else {
-        "diagnostics".to_string()
+        None
+    };
+
+    let glob_is_exact_file_match = if let Some(path) = options
+        .path_matcher
+        .as_ref()
+        .and_then(|pm| pm.sources().first())
+    {
+        PathBuf::try_from(path)
+            .ok()
+            .and_then(|path| {
+                project.read(cx).worktrees(cx).find_map(|worktree| {
+                    let worktree = worktree.read(cx);
+                    let worktree_root_path = Path::new(worktree.root_name());
+                    let relative_path = path.strip_prefix(worktree_root_path).ok()?;
+                    worktree.absolutize(&relative_path).ok()
+                })
+            })
+            .is_some()
+    } else {
+        false
     };
 
     let project_handle = project.downgrade();
-    let diagnostic_summaries: Vec<_> = project.read(cx).diagnostic_summaries(false, cx).collect();
+    let diagnostic_summaries: Vec<_> = project
+        .read(cx)
+        .diagnostic_summaries(false, cx)
+        .flat_map(|(path, _, summary)| {
+            let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
+            let mut path_buf = PathBuf::from(worktree.read(cx).root_name());
+            path_buf.push(&path.path);
+            Some((path, path_buf, summary))
+        })
+        .collect();
 
     cx.spawn(|mut cx| async move {
-        let mut text = String::new();
-        writeln!(text, "{}", &header).unwrap();
-        let mut sections: Vec<(Range<usize>, PlaceholderType)> = Vec::new();
+        let mut output = SlashCommandOutput::default();
+
+        if let Some(error_source) = error_source.as_ref() {
+            writeln!(output.text, "diagnostics: {}", error_source).unwrap();
+        } else {
+            writeln!(output.text, "diagnostics").unwrap();
+        }
 
         let mut project_summary = DiagnosticSummary::default();
-        for (project_path, _, summary) in diagnostic_summaries {
+        for (project_path, path, summary) in diagnostic_summaries {
             if let Some(path_matcher) = &options.path_matcher {
-                if !path_matcher.is_match(&project_path.path) {
+                if !path_matcher.is_match(&path) {
                     continue;
                 }
             }
@@ -252,52 +281,84 @@ fn collect_diagnostics(
                 continue;
             }
 
-            let last_end = text.len();
-            let file_path = project_path.path.to_string_lossy().to_string();
-            writeln!(&mut text, "{file_path}").unwrap();
+            let last_end = output.text.len();
+            let file_path = path.to_string_lossy().to_string();
+            if !glob_is_exact_file_match {
+                writeln!(&mut output.text, "{file_path}").unwrap();
+            }
 
             if let Some(buffer) = project_handle
                 .update(&mut cx, |project, cx| project.open_buffer(project_path, cx))?
                 .await
                 .log_err()
             {
-                collect_buffer_diagnostics(
-                    &mut text,
-                    &mut sections,
-                    cx.read_model(&buffer, |buffer, _| buffer.snapshot())?,
-                    options.include_warnings,
-                );
+                let snapshot = cx.read_model(&buffer, |buffer, _| buffer.snapshot())?;
+                collect_buffer_diagnostics(&mut output, &snapshot, options.include_warnings);
             }
 
-            sections.push((
-                last_end..text.len().saturating_sub(1),
-                PlaceholderType::File(file_path),
-            ))
+            if !glob_is_exact_file_match {
+                output.sections.push(SlashCommandOutputSection {
+                    range: last_end..output.text.len().saturating_sub(1),
+                    icon: IconName::File,
+                    label: file_path.into(),
+                    metadata: None,
+                });
+            }
         }
-        sections.push((
-            0..text.len(),
-            PlaceholderType::Root(project_summary, header),
-        ));
 
-        Ok((text, sections))
+        // No diagnostics found
+        if output.sections.is_empty() {
+            return Ok(None);
+        }
+
+        let mut label = String::new();
+        label.push_str("Diagnostics");
+        if let Some(source) = error_source {
+            write!(label, " ({})", source).unwrap();
+        }
+
+        if project_summary.error_count > 0 || project_summary.warning_count > 0 {
+            label.push(':');
+
+            if project_summary.error_count > 0 {
+                write!(label, " {} errors", project_summary.error_count).unwrap();
+                if project_summary.warning_count > 0 {
+                    label.push_str(",");
+                }
+            }
+
+            if project_summary.warning_count > 0 {
+                write!(label, " {} warnings", project_summary.warning_count).unwrap();
+            }
+        }
+
+        output.sections.insert(
+            0,
+            SlashCommandOutputSection {
+                range: 0..output.text.len(),
+                icon: IconName::Warning,
+                label: label.into(),
+                metadata: None,
+            },
+        );
+
+        Ok(Some(output))
     })
 }
 
-fn collect_buffer_diagnostics(
-    text: &mut String,
-    sections: &mut Vec<(Range<usize>, PlaceholderType)>,
-    snapshot: BufferSnapshot,
+pub fn collect_buffer_diagnostics(
+    output: &mut SlashCommandOutput,
+    snapshot: &BufferSnapshot,
     include_warnings: bool,
 ) {
     for (_, group) in snapshot.diagnostic_groups(None) {
         let entry = &group.entries[group.primary_ix];
-        collect_diagnostic(text, sections, entry, &snapshot, include_warnings)
+        collect_diagnostic(output, entry, &snapshot, include_warnings)
     }
 }
 
 fn collect_diagnostic(
-    text: &mut String,
-    sections: &mut Vec<(Range<usize>, PlaceholderType)>,
+    output: &mut SlashCommandOutput,
     entry: &DiagnosticEntry<Anchor>,
     snapshot: &BufferSnapshot,
     include_warnings: bool,
@@ -305,17 +366,17 @@ fn collect_diagnostic(
     const EXCERPT_EXPANSION_SIZE: u32 = 2;
     const MAX_MESSAGE_LENGTH: usize = 2000;
 
-    let ty = match entry.diagnostic.severity {
+    let (ty, icon) = match entry.diagnostic.severity {
         DiagnosticSeverity::WARNING => {
             if !include_warnings {
                 return;
             }
-            DiagnosticType::Warning
+            ("warning", IconName::Warning)
         }
-        DiagnosticSeverity::ERROR => DiagnosticType::Error,
+        DiagnosticSeverity::ERROR => ("error", IconName::XCircle),
         _ => return,
     };
-    let prev_len = text.len();
+    let prev_len = output.text.len();
 
     let range = entry.range.to_point(snapshot);
     let diagnostic_row_number = range.start.row + 1;
@@ -325,11 +386,11 @@ fn collect_diagnostic(
     let excerpt_range =
         Point::new(start_row, 0).to_offset(&snapshot)..Point::new(end_row, 0).to_offset(&snapshot);
 
-    text.push_str("```");
+    output.text.push_str("```");
     if let Some(language_name) = snapshot.language().map(|l| l.code_fence_block_name()) {
-        text.push_str(&language_name);
+        output.text.push_str(&language_name);
     }
-    text.push('\n');
+    output.text.push('\n');
 
     let mut buffer_text = String::new();
     for chunk in snapshot.text_for_range(excerpt_range) {
@@ -338,107 +399,26 @@ fn collect_diagnostic(
 
     for (i, line) in buffer_text.lines().enumerate() {
         let line_number = start_row + i as u32 + 1;
-        writeln!(text, "{}", line).unwrap();
+        writeln!(output.text, "{}", line).unwrap();
 
         if line_number == diagnostic_row_number {
-            text.push_str("//");
-            let prev_len = text.len();
-            write!(text, " {}: ", ty.as_str()).unwrap();
-            let padding = text.len() - prev_len;
+            output.text.push_str("//");
+            let prev_len = output.text.len();
+            write!(output.text, " {}: ", ty).unwrap();
+            let padding = output.text.len() - prev_len;
 
             let message = util::truncate(&entry.diagnostic.message, MAX_MESSAGE_LENGTH)
                 .replace('\n', format!("\n//{:padding$}", "").as_str());
 
-            writeln!(text, "{message}").unwrap();
+            writeln!(output.text, "{message}").unwrap();
         }
     }
 
-    writeln!(text, "```").unwrap();
-    sections.push((
-        prev_len..text.len().saturating_sub(1),
-        PlaceholderType::Diagnostic(ty, entry.diagnostic.message.clone()),
-    ))
-}
-
-#[derive(Clone)]
-pub enum PlaceholderType {
-    Root(DiagnosticSummary, String),
-    File(String),
-    Diagnostic(DiagnosticType, String),
-}
-
-#[derive(Copy, Clone, IntoElement)]
-pub enum DiagnosticType {
-    Warning,
-    Error,
-}
-
-impl DiagnosticType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            DiagnosticType::Warning => "warning",
-            DiagnosticType::Error => "error",
-        }
-    }
-}
-
-#[derive(IntoElement)]
-pub struct DiagnosticsPlaceholder {
-    pub id: ElementId,
-    pub placeholder_type: PlaceholderType,
-    pub unfold: Arc<dyn Fn(&mut WindowContext)>,
-}
-
-impl RenderOnce for DiagnosticsPlaceholder {
-    fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
-        let unfold = self.unfold;
-        let (icon, content) = match self.placeholder_type {
-            PlaceholderType::Root(summary, title) => (
-                h_flex()
-                    .w_full()
-                    .gap_0p5()
-                    .when(summary.error_count > 0, |this| {
-                        this.child(DiagnosticType::Error)
-                            .child(Label::new(summary.error_count.to_string()))
-                    })
-                    .when(summary.warning_count > 0, |this| {
-                        this.child(DiagnosticType::Warning)
-                            .child(Label::new(summary.warning_count.to_string()))
-                    })
-                    .into_any_element(),
-                Label::new(title),
-            ),
-            PlaceholderType::File(file) => (
-                Icon::new(IconName::File).into_any_element(),
-                Label::new(file),
-            ),
-            PlaceholderType::Diagnostic(diagnostic_type, message) => (
-                diagnostic_type.into_any_element(),
-                Label::new(message).single_line(),
-            ),
-        };
-
-        ButtonLike::new(self.id)
-            .style(ButtonStyle::Filled)
-            .layer(ElevationIndex::ElevatedSurface)
-            .child(icon)
-            .child(content)
-            .on_click(move |_, cx| unfold(cx))
-    }
-}
-
-impl RenderOnce for DiagnosticType {
-    fn render(self, cx: &mut WindowContext) -> impl IntoElement {
-        svg()
-            .size(cx.text_style().font_size)
-            .flex_none()
-            .map(|icon| match self {
-                DiagnosticType::Error => icon
-                    .path(IconName::XCircle.path())
-                    .text_color(Color::Error.color(cx)),
-                DiagnosticType::Warning => icon
-                    .path(IconName::ExclamationTriangle.path())
-                    .text_color(Color::Warning.color(cx)),
-            })
-    }
+    writeln!(output.text, "```").unwrap();
+    output.sections.push(SlashCommandOutputSection {
+        range: prev_len..output.text.len().saturating_sub(1),
+        icon,
+        label: entry.diagnostic.message.clone().into(),
+        metadata: None,
+    });
 }

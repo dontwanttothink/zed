@@ -6,6 +6,7 @@ use crate::{
     },
 };
 use anyhow::{anyhow, Result};
+use assistant::{ContextStore, PromptBuilder};
 use call::{room, ActiveCall, ParticipantLocation, Room};
 use client::{User, RECEIVE_TIMEOUT};
 use collections::{HashMap, HashSet};
@@ -17,7 +18,9 @@ use gpui::{
     TestAppContext, UpdateGlobal,
 };
 use language::{
-    language_settings::{AllLanguageSettings, Formatter, PrettierSettings},
+    language_settings::{
+        AllLanguageSettings, Formatter, FormatterList, PrettierSettings, SelectedFormatter,
+    },
     tree_sitter_rust, Diagnostic, DiagnosticEntry, FakeLspAdapter, Language, LanguageConfig,
     LanguageMatcher, LineEnding, OffsetRangeExt, Point, Rope,
 };
@@ -25,8 +28,8 @@ use live_kit_client::MacOSDisplay;
 use lsp::LanguageServerId;
 use parking_lot::Mutex;
 use project::{
-    search::SearchQuery, DiagnosticSummary, FormatTrigger, HoverBlockKind, Project, ProjectPath,
-    SearchResult,
+    search::SearchQuery, search::SearchResult, DiagnosticSummary, FormatTrigger, HoverBlockKind,
+    Project, ProjectPath,
 };
 use rand::prelude::*;
 use serde_json::json;
@@ -535,10 +538,7 @@ async fn test_joining_channels_and_calling_multiple_users_simultaneously(
 
     // Leave the room
     active_call_a
-        .update(cx_a, |call, cx| {
-            let hang_up = call.hang_up(cx);
-            hang_up
-        })
+        .update(cx_a, |call, cx| call.hang_up(cx))
         .await
         .unwrap();
 
@@ -571,10 +571,7 @@ async fn test_joining_channels_and_calling_multiple_users_simultaneously(
 
     // Leave the room
     active_call_a
-        .update(cx_a, |call, cx| {
-            let hang_up = call.hang_up(cx);
-            hang_up
-        })
+        .update(cx_a, |call, cx| call.hang_up(cx))
         .await
         .unwrap();
 
@@ -1374,7 +1371,7 @@ async fn test_unshare_project(
         .await
         .unwrap();
 
-    let worktree_a = project_a.read_with(cx_a, |project, _| project.worktrees().next().unwrap());
+    let worktree_a = project_a.read_with(cx_a, |project, cx| project.worktrees(cx).next().unwrap());
     let project_b = client_b.build_dev_server_project(project_id, cx_b).await;
     executor.run_until_parked();
 
@@ -1502,7 +1499,8 @@ async fn test_project_reconnect(
     let (project_a1, _) = client_a.build_local_project("/root-1/dir1", cx_a).await;
     let (project_a2, _) = client_a.build_local_project("/root-2", cx_a).await;
     let (project_a3, _) = client_a.build_local_project("/root-3", cx_a).await;
-    let worktree_a1 = project_a1.read_with(cx_a, |project, _| project.worktrees().next().unwrap());
+    let worktree_a1 =
+        project_a1.read_with(cx_a, |project, cx| project.worktrees(cx).next().unwrap());
     let project1_id = active_call_a
         .update(cx_a, |call, cx| call.share_project(project_a1.clone(), cx))
         .await
@@ -1527,7 +1525,7 @@ async fn test_project_reconnect(
     });
     let (worktree_a2, _) = project_a1
         .update(cx_a, |p, cx| {
-            p.find_or_create_local_worktree("/root-1/dir2", true, cx)
+            p.find_or_create_worktree("/root-1/dir2", true, cx)
         })
         .await
         .unwrap();
@@ -1600,7 +1598,7 @@ async fn test_project_reconnect(
     });
     let (worktree_a3, _) = project_a1
         .update(cx_a, |p, cx| {
-            p.find_or_create_local_worktree("/root-1/dir3", true, cx)
+            p.find_or_create_worktree("/root-1/dir3", true, cx)
         })
         .await
         .unwrap();
@@ -1724,7 +1722,7 @@ async fn test_project_reconnect(
     // While client B is disconnected, add and remove worktrees from client A's project.
     let (worktree_a4, _) = project_a1
         .update(cx_a, |p, cx| {
-            p.find_or_create_local_worktree("/root-1/dir4", true, cx)
+            p.find_or_create_worktree("/root-1/dir4", true, cx)
         })
         .await
         .unwrap();
@@ -2275,7 +2273,7 @@ async fn test_propagate_saves_and_fs_changes(
             },
             ..Default::default()
         },
-        Some(tree_sitter_rust::language()),
+        Some(tree_sitter_rust::LANGUAGE.into()),
     ));
     let javascript = Arc::new(Language::new(
         LanguageConfig {
@@ -2286,7 +2284,7 @@ async fn test_propagate_saves_and_fs_changes(
             },
             ..Default::default()
         },
-        Some(tree_sitter_rust::language()),
+        Some(tree_sitter_rust::LANGUAGE.into()),
     ));
     for client in [&client_a, &client_b, &client_c] {
         client.language_registry().add(rust.clone());
@@ -2305,7 +2303,7 @@ async fn test_propagate_saves_and_fs_changes(
         .await;
     let (project_a, worktree_id) = client_a.build_local_project("/a", cx_a).await;
 
-    let worktree_a = project_a.read_with(cx_a, |p, _| p.worktrees().next().unwrap());
+    let worktree_a = project_a.read_with(cx_a, |p, cx| p.worktrees(cx).next().unwrap());
     let project_id = active_call_a
         .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
         .await
@@ -2315,9 +2313,9 @@ async fn test_propagate_saves_and_fs_changes(
     let project_b = client_b.build_dev_server_project(project_id, cx_b).await;
     let project_c = client_c.build_dev_server_project(project_id, cx_c).await;
 
-    let worktree_b = project_b.read_with(cx_b, |p, _| p.worktrees().next().unwrap());
+    let worktree_b = project_b.read_with(cx_b, |p, cx| p.worktrees(cx).next().unwrap());
 
-    let worktree_c = project_c.read_with(cx_c, |p, _| p.worktrees().next().unwrap());
+    let worktree_c = project_c.read_with(cx_c, |p, cx| p.worktrees(cx).next().unwrap());
 
     // Open and edit a buffer as both guests B and C.
     let buffer_b = project_b
@@ -2330,11 +2328,11 @@ async fn test_propagate_saves_and_fs_changes(
         .unwrap();
 
     buffer_b.read_with(cx_b, |buffer, _| {
-        assert_eq!(&*buffer.language().unwrap().name(), "Rust");
+        assert_eq!(buffer.language().unwrap().name(), "Rust".into());
     });
 
     buffer_c.read_with(cx_c, |buffer, _| {
-        assert_eq!(&*buffer.language().unwrap().name(), "Rust");
+        assert_eq!(buffer.language().unwrap().name(), "Rust".into());
     });
     buffer_b.update(cx_b, |buf, cx| buf.edit([(0..0, "i-am-b, ")], None, cx));
     buffer_c.update(cx_c, |buf, cx| buf.edit([(0..0, "i-am-c, ")], None, cx));
@@ -2434,17 +2432,17 @@ async fn test_propagate_saves_and_fs_changes(
 
     buffer_a.read_with(cx_a, |buffer, _| {
         assert_eq!(buffer.file().unwrap().path().to_str(), Some("file1.js"));
-        assert_eq!(&*buffer.language().unwrap().name(), "JavaScript");
+        assert_eq!(buffer.language().unwrap().name(), "JavaScript".into());
     });
 
     buffer_b.read_with(cx_b, |buffer, _| {
         assert_eq!(buffer.file().unwrap().path().to_str(), Some("file1.js"));
-        assert_eq!(&*buffer.language().unwrap().name(), "JavaScript");
+        assert_eq!(buffer.language().unwrap().name(), "JavaScript".into());
     });
 
     buffer_c.read_with(cx_c, |buffer, _| {
         assert_eq!(buffer.file().unwrap().path().to_str(), Some("file1.js"));
-        assert_eq!(&*buffer.language().unwrap().name(), "JavaScript");
+        assert_eq!(buffer.language().unwrap().name(), "JavaScript".into());
     });
 
     let new_buffer_a = project_a
@@ -2574,7 +2572,7 @@ async fn test_git_diff_base_change(
         );
         git::diff::assert_hunks(
             buffer.snapshot().git_diff_hunks_in_row_range(0..4),
-            &buffer,
+            buffer,
             &diff_base,
             &[(1..2, "", "two\n")],
         );
@@ -2598,7 +2596,7 @@ async fn test_git_diff_base_change(
         );
         git::diff::assert_hunks(
             buffer.snapshot().git_diff_hunks_in_row_range(0..4),
-            &buffer,
+            buffer,
             &diff_base,
             &[(1..2, "", "two\n")],
         );
@@ -2622,7 +2620,7 @@ async fn test_git_diff_base_change(
 
         git::diff::assert_hunks(
             buffer.snapshot().git_diff_hunks_in_row_range(0..4),
-            &buffer,
+            buffer,
             &diff_base,
             &[(2..3, "", "three\n")],
         );
@@ -2637,7 +2635,7 @@ async fn test_git_diff_base_change(
         );
         git::diff::assert_hunks(
             buffer.snapshot().git_diff_hunks_in_row_range(0..4),
-            &buffer,
+            buffer,
             &diff_base,
             &[(2..3, "", "three\n")],
         );
@@ -2680,7 +2678,7 @@ async fn test_git_diff_base_change(
         );
         git::diff::assert_hunks(
             buffer.snapshot().git_diff_hunks_in_row_range(0..4),
-            &buffer,
+            buffer,
             &diff_base,
             &[(1..2, "", "two\n")],
         );
@@ -2704,7 +2702,7 @@ async fn test_git_diff_base_change(
         );
         git::diff::assert_hunks(
             buffer.snapshot().git_diff_hunks_in_row_range(0..4),
-            &buffer,
+            buffer,
             &diff_base,
             &[(1..2, "", "two\n")],
         );
@@ -2737,7 +2735,7 @@ async fn test_git_diff_base_change(
 
         git::diff::assert_hunks(
             buffer.snapshot().git_diff_hunks_in_row_range(0..4),
-            &buffer,
+            buffer,
             &diff_base,
             &[(2..3, "", "three\n")],
         );
@@ -2752,7 +2750,7 @@ async fn test_git_diff_base_change(
         );
         git::diff::assert_hunks(
             buffer.snapshot().git_diff_hunks_in_row_range(0..4),
-            &buffer,
+            buffer,
             &diff_base,
             &[(2..3, "", "three\n")],
         );
@@ -2880,8 +2878,8 @@ async fn test_git_status_sync(
     client_a.fs().set_status_for_repo_via_git_operation(
         Path::new("/dir/.git"),
         &[
-            (&Path::new(A_TXT), GitFileStatus::Added),
-            (&Path::new(B_TXT), GitFileStatus::Added),
+            (Path::new(A_TXT), GitFileStatus::Added),
+            (Path::new(B_TXT), GitFileStatus::Added),
         ],
     );
 
@@ -2928,8 +2926,8 @@ async fn test_git_status_sync(
     client_a.fs().set_status_for_repo_via_working_copy_change(
         Path::new("/dir/.git"),
         &[
-            (&Path::new(A_TXT), GitFileStatus::Modified),
-            (&Path::new(B_TXT), GitFileStatus::Modified),
+            (Path::new(A_TXT), GitFileStatus::Modified),
+            (Path::new(B_TXT), GitFileStatus::Modified),
         ],
     );
 
@@ -3019,8 +3017,8 @@ async fn test_fs_operations(
         .unwrap();
     let project_b = client_b.build_dev_server_project(project_id, cx_b).await;
 
-    let worktree_a = project_a.read_with(cx_a, |project, _| project.worktrees().next().unwrap());
-    let worktree_b = project_b.read_with(cx_b, |project, _| project.worktrees().next().unwrap());
+    let worktree_a = project_a.read_with(cx_a, |project, cx| project.worktrees(cx).next().unwrap());
+    let worktree_b = project_b.read_with(cx_b, |project, cx| project.worktrees(cx).next().unwrap());
 
     let entry = project_b
         .update(cx_b, |project, cx| {
@@ -3174,7 +3172,7 @@ async fn test_fs_operations(
 
     project_b
         .update(cx_b, |project, cx| {
-            project.copy_entry(entry.id, Path::new("f.txt"), cx)
+            project.copy_entry(entry.id, None, Path::new("f.txt"), cx)
         })
         .await
         .unwrap()
@@ -3320,13 +3318,13 @@ async fn test_local_settings(
     // As client B, join that project and observe the local settings.
     let project_b = client_b.build_dev_server_project(project_id, cx_b).await;
 
-    let worktree_b = project_b.read_with(cx_b, |project, _| project.worktrees().next().unwrap());
+    let worktree_b = project_b.read_with(cx_b, |project, cx| project.worktrees(cx).next().unwrap());
     executor.run_until_parked();
     cx_b.read(|cx| {
         let store = cx.global::<SettingsStore>();
         assert_eq!(
             store
-                .local_settings(worktree_b.read(cx).id().to_usize())
+                .local_settings(worktree_b.read(cx).id())
                 .collect::<Vec<_>>(),
             &[
                 (Path::new("").into(), r#"{"tab_size":2}"#.to_string()),
@@ -3345,7 +3343,7 @@ async fn test_local_settings(
         let store = cx.global::<SettingsStore>();
         assert_eq!(
             store
-                .local_settings(worktree_b.read(cx).id().to_usize())
+                .local_settings(worktree_b.read(cx).id())
                 .collect::<Vec<_>>(),
             &[
                 (Path::new("").into(), r#"{}"#.to_string()),
@@ -3374,7 +3372,7 @@ async fn test_local_settings(
         let store = cx.global::<SettingsStore>();
         assert_eq!(
             store
-                .local_settings(worktree_b.read(cx).id().to_usize())
+                .local_settings(worktree_b.read(cx).id())
                 .collect::<Vec<_>>(),
             &[
                 (Path::new("a").into(), r#"{"tab_size":8}"#.to_string()),
@@ -3406,7 +3404,7 @@ async fn test_local_settings(
         let store = cx.global::<SettingsStore>();
         assert_eq!(
             store
-                .local_settings(worktree_b.read(cx).id().to_usize())
+                .local_settings(worktree_b.read(cx).id())
                 .collect::<Vec<_>>(),
             &[(Path::new("a").into(), r#"{"hard_tabs":true}"#.to_string()),]
         )
@@ -3732,7 +3730,7 @@ async fn test_leaving_project(
     // Client B opens a buffer.
     let buffer_b1 = project_b1
         .update(cx_b, |project, cx| {
-            let worktree_id = project.worktrees().next().unwrap().read(cx).id();
+            let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
             project.open_buffer((worktree_id, "a.txt"), cx)
         })
         .await
@@ -3770,7 +3768,7 @@ async fn test_leaving_project(
 
     let buffer_b2 = project_b2
         .update(cx_b, |project, cx| {
-            let worktree_id = project.worktrees().next().unwrap().read(cx).id();
+            let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
             project.open_buffer((worktree_id, "a.txt"), cx)
         })
         .await
@@ -3857,11 +3855,11 @@ async fn test_collaborating_with_diagnostics(
             },
             ..Default::default()
         },
-        Some(tree_sitter_rust::language()),
+        Some(tree_sitter_rust::LANGUAGE.into()),
     )));
     let mut fake_language_servers = client_a
         .language_registry()
-        .register_fake_lsp_adapter("Rust", Default::default());
+        .register_fake_lsp("Rust", Default::default());
 
     // Share a project as client A
     client_a
@@ -3897,7 +3895,7 @@ async fn test_collaborating_with_diagnostics(
         .await;
     fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
         lsp::PublishDiagnosticsParams {
-            uri: lsp::Uri::from_file_path("/a/a.rs").unwrap().into(),
+            uri: lsp::Url::from_file_path("/a/a.rs").unwrap(),
             version: None,
             diagnostics: vec![lsp::Diagnostic {
                 severity: Some(lsp::DiagnosticSeverity::WARNING),
@@ -3917,7 +3915,7 @@ async fn test_collaborating_with_diagnostics(
         .unwrap();
     fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
         lsp::PublishDiagnosticsParams {
-            uri: lsp::Uri::from_file_path("/a/a.rs").unwrap().into(),
+            uri: lsp::Url::from_file_path("/a/a.rs").unwrap(),
             version: None,
             diagnostics: vec![lsp::Diagnostic {
                 severity: Some(lsp::DiagnosticSeverity::ERROR),
@@ -3991,7 +3989,7 @@ async fn test_collaborating_with_diagnostics(
     // Simulate a language server reporting more errors for a file.
     fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
         lsp::PublishDiagnosticsParams {
-            uri: lsp::Uri::from_file_path("/a/a.rs").unwrap().into(),
+            uri: lsp::Url::from_file_path("/a/a.rs").unwrap(),
             version: None,
             diagnostics: vec![
                 lsp::Diagnostic {
@@ -4085,7 +4083,7 @@ async fn test_collaborating_with_diagnostics(
     // Simulate a language server reporting no errors for a file.
     fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
         lsp::PublishDiagnosticsParams {
-            uri: lsp::Uri::from_file_path("/a/a.rs").unwrap().into(),
+            uri: lsp::Url::from_file_path("/a/a.rs").unwrap(),
             version: None,
             diagnostics: vec![],
         },
@@ -4128,7 +4126,7 @@ async fn test_collaborating_with_lsp_progress_updates_and_diagnostics_ordering(
         .await;
 
     client_a.language_registry().add(rust_lang());
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             disk_based_diagnostics_progress_token: Some("the-disk-based-token".into()),
@@ -4189,9 +4187,7 @@ async fn test_collaborating_with_lsp_progress_updates_and_diagnostics_ordering(
     for file_name in file_names {
         fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
             lsp::PublishDiagnosticsParams {
-                uri: lsp::Uri::from_file_path(Path::new("/test").join(file_name))
-                    .unwrap()
-                    .into(),
+                uri: lsp::Url::from_file_path(Path::new("/test").join(file_name)).unwrap(),
                 version: None,
                 diagnostics: vec![lsp::Diagnostic {
                     severity: Some(lsp::DiagnosticSeverity::WARNING),
@@ -4353,7 +4349,7 @@ async fn test_formatting_buffer(
     client_a.language_registry().add(rust_lang());
     let mut fake_language_servers = client_a
         .language_registry()
-        .register_fake_lsp_adapter("Rust", FakeLspAdapter::default());
+        .register_fake_lsp("Rust", FakeLspAdapter::default());
 
     // Here we insert a fake tree with a directory that exists on disk. This is needed
     // because later we'll invoke a command, which requires passing a working directory
@@ -4410,10 +4406,13 @@ async fn test_formatting_buffer(
     cx_a.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
             store.update_user_settings::<AllLanguageSettings>(cx, |file| {
-                file.defaults.formatter = Some(Formatter::External {
-                    command: "awk".into(),
-                    arguments: vec!["{sub(/two/,\"{buffer_path}\")}1".to_string()].into(),
-                });
+                file.defaults.formatter = Some(SelectedFormatter::List(FormatterList(
+                    vec![Formatter::External {
+                        command: "awk".into(),
+                        arguments: vec!["{sub(/two/,\"{buffer_path}\")}1".to_string()].into(),
+                    }]
+                    .into(),
+                )));
             });
         });
     });
@@ -4459,9 +4458,9 @@ async fn test_prettier_formatting_buffer(
             },
             ..Default::default()
         },
-        Some(tree_sitter_rust::language()),
+        Some(tree_sitter_rust::LANGUAGE.into()),
     )));
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "TypeScript",
         FakeLspAdapter {
             prettier_plugins: vec![test_plugin],
@@ -4494,7 +4493,7 @@ async fn test_prettier_formatting_buffer(
     cx_a.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
             store.update_user_settings::<AllLanguageSettings>(cx, |file| {
-                file.defaults.formatter = Some(Formatter::Auto);
+                file.defaults.formatter = Some(SelectedFormatter::Auto);
                 file.defaults.prettier = Some(PrettierSettings {
                     allowed: true,
                     ..PrettierSettings::default()
@@ -4505,7 +4504,9 @@ async fn test_prettier_formatting_buffer(
     cx_b.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
             store.update_user_settings::<AllLanguageSettings>(cx, |file| {
-                file.defaults.formatter = Some(Formatter::LanguageServer);
+                file.defaults.formatter = Some(SelectedFormatter::List(FormatterList(
+                    vec![Formatter::LanguageServer { name: None }].into(),
+                )));
                 file.defaults.prettier = Some(PrettierSettings {
                     allowed: true,
                     ..PrettierSettings::default()
@@ -4575,7 +4576,7 @@ async fn test_definition(
 
     let mut fake_language_servers = client_a
         .language_registry()
-        .register_fake_lsp_adapter("Rust", Default::default());
+        .register_fake_lsp("Rust", Default::default());
     client_a.language_registry().add(rust_lang());
 
     client_a
@@ -4609,7 +4610,7 @@ async fn test_definition(
     fake_language_server.handle_request::<lsp::request::GotoDefinition, _, _>(|_, _| async move {
         Ok(Some(lsp::GotoDefinitionResponse::Scalar(
             lsp::Location::new(
-                lsp::Uri::from_file_path("/root/dir-2/b.rs").unwrap().into(),
+                lsp::Url::from_file_path("/root/dir-2/b.rs").unwrap(),
                 lsp::Range::new(lsp::Position::new(0, 6), lsp::Position::new(0, 9)),
             ),
         )))
@@ -4621,7 +4622,7 @@ async fn test_definition(
         .unwrap();
     cx_b.read(|cx| {
         assert_eq!(definitions_1.len(), 1);
-        assert_eq!(project_b.read(cx).worktrees().count(), 2);
+        assert_eq!(project_b.read(cx).worktrees(cx).count(), 2);
         let target_buffer = definitions_1[0].target.buffer.read(cx);
         assert_eq!(
             target_buffer.text(),
@@ -4638,7 +4639,7 @@ async fn test_definition(
     fake_language_server.handle_request::<lsp::request::GotoDefinition, _, _>(|_, _| async move {
         Ok(Some(lsp::GotoDefinitionResponse::Scalar(
             lsp::Location::new(
-                lsp::Uri::from_file_path("/root/dir-2/b.rs").unwrap().into(),
+                lsp::Url::from_file_path("/root/dir-2/b.rs").unwrap(),
                 lsp::Range::new(lsp::Position::new(1, 6), lsp::Position::new(1, 11)),
             ),
         )))
@@ -4650,7 +4651,7 @@ async fn test_definition(
         .unwrap();
     cx_b.read(|cx| {
         assert_eq!(definitions_2.len(), 1);
-        assert_eq!(project_b.read(cx).worktrees().count(), 2);
+        assert_eq!(project_b.read(cx).worktrees(cx).count(), 2);
         let target_buffer = definitions_2[0].target.buffer.read(cx);
         assert_eq!(
             target_buffer.text(),
@@ -4674,7 +4675,7 @@ async fn test_definition(
             );
             Ok(Some(lsp::GotoDefinitionResponse::Scalar(
                 lsp::Location::new(
-                    lsp::Uri::from_file_path("/root/dir-2/c.rs").unwrap().into(),
+                    lsp::Url::from_file_path("/root/dir-2/c.rs").unwrap(),
                     lsp::Range::new(lsp::Position::new(0, 5), lsp::Position::new(0, 7)),
                 ),
             )))
@@ -4711,7 +4712,7 @@ async fn test_references(
     let active_call_a = cx_a.read(ActiveCall::global);
 
     client_a.language_registry().add(rust_lang());
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             name: "my-fake-lsp-adapter",
@@ -4773,8 +4774,8 @@ async fn test_references(
 
     // User is informed that a request is pending.
     executor.run_until_parked();
-    project_b.read_with(cx_b, |project, _| {
-        let status = project.language_server_statuses().next().cloned().unwrap();
+    project_b.read_with(cx_b, |project, cx| {
+        let status = project.language_server_statuses(cx).next().unwrap().1;
         assert_eq!(status.name, "my-fake-lsp-adapter");
         assert_eq!(
             status.pending_work.values().next().unwrap().message,
@@ -4786,21 +4787,15 @@ async fn test_references(
     lsp_response_tx
         .unbounded_send(Ok(Some(vec![
             lsp::Location {
-                uri: lsp::Uri::from_file_path("/root/dir-1/two.rs")
-                    .unwrap()
-                    .into(),
+                uri: lsp::Url::from_file_path("/root/dir-1/two.rs").unwrap(),
                 range: lsp::Range::new(lsp::Position::new(0, 24), lsp::Position::new(0, 27)),
             },
             lsp::Location {
-                uri: lsp::Uri::from_file_path("/root/dir-1/two.rs")
-                    .unwrap()
-                    .into(),
+                uri: lsp::Url::from_file_path("/root/dir-1/two.rs").unwrap(),
                 range: lsp::Range::new(lsp::Position::new(0, 35), lsp::Position::new(0, 38)),
             },
             lsp::Location {
-                uri: lsp::Uri::from_file_path("/root/dir-2/three.rs")
-                    .unwrap()
-                    .into(),
+                uri: lsp::Url::from_file_path("/root/dir-2/three.rs").unwrap(),
                 range: lsp::Range::new(lsp::Position::new(0, 37), lsp::Position::new(0, 40)),
             },
         ])))
@@ -4810,11 +4805,11 @@ async fn test_references(
     executor.run_until_parked();
     project_b.read_with(cx_b, |project, cx| {
         // User is informed that a request is no longer pending.
-        let status = project.language_server_statuses().next().unwrap();
+        let status = project.language_server_statuses(cx).next().unwrap().1;
         assert!(status.pending_work.is_empty());
 
         assert_eq!(references.len(), 3);
-        assert_eq!(project.worktrees().count(), 2);
+        assert_eq!(project.worktrees(cx).count(), 2);
 
         let two_buffer = references[0].buffer.read(cx);
         let three_buffer = references[2].buffer.read(cx);
@@ -4837,8 +4832,8 @@ async fn test_references(
 
     // User is informed that a request is pending.
     executor.run_until_parked();
-    project_b.read_with(cx_b, |project, _| {
-        let status = project.language_server_statuses().next().cloned().unwrap();
+    project_b.read_with(cx_b, |project, cx| {
+        let status = project.language_server_statuses(cx).next().unwrap().1;
         assert_eq!(status.name, "my-fake-lsp-adapter");
         assert_eq!(
             status.pending_work.values().next().unwrap().message,
@@ -4854,8 +4849,8 @@ async fn test_references(
 
     // User is informed that the request is no longer pending.
     executor.run_until_parked();
-    project_b.read_with(cx_b, |project, _| {
-        let status = project.language_server_statuses().next().unwrap();
+    project_b.read_with(cx_b, |project, cx| {
+        let status = project.language_server_statuses(cx).next().unwrap().1;
         assert!(status.pending_work.is_empty());
     });
 }
@@ -4894,7 +4889,7 @@ async fn test_project_search(
     let (project_a, _) = client_a.build_local_project("/root/dir-1", cx_a).await;
     let (worktree_2, _) = project_a
         .update(cx_a, |p, cx| {
-            p.find_or_create_local_worktree("/root/dir-2", true, cx)
+            p.find_or_create_worktree("/root/dir-2", true, cx)
         })
         .await
         .unwrap();
@@ -4912,7 +4907,16 @@ async fn test_project_search(
     let mut results = HashMap::default();
     let mut search_rx = project_b.update(cx_b, |project, cx| {
         project.search(
-            SearchQuery::text("world", false, false, false, Vec::new(), Vec::new()).unwrap(),
+            SearchQuery::text(
+                "world",
+                false,
+                false,
+                false,
+                Default::default(),
+                Default::default(),
+                None,
+            )
+            .unwrap(),
             cx,
         )
     });
@@ -4979,7 +4983,7 @@ async fn test_document_highlights(
 
     let mut fake_language_servers = client_a
         .language_registry()
-        .register_fake_lsp_adapter("Rust", Default::default());
+        .register_fake_lsp("Rust", Default::default());
     client_a.language_registry().add(rust_lang());
 
     let (project_a, worktree_id) = client_a.build_local_project("/root-1", cx_a).await;
@@ -5075,11 +5079,9 @@ async fn test_lsp_hover(
 
     client_a.language_registry().add(rust_lang());
     let language_server_names = ["rust-analyzer", "CrabLang-ls"];
-    let mut fake_language_servers = client_a
-        .language_registry()
-        .register_specific_fake_lsp_adapter(
+    let mut language_servers = [
+        client_a.language_registry().register_fake_lsp(
             "Rust",
-            true,
             FakeLspAdapter {
                 name: "rust-analyzer",
                 capabilities: lsp::ServerCapabilities {
@@ -5088,12 +5090,9 @@ async fn test_lsp_hover(
                 },
                 ..FakeLspAdapter::default()
             },
-        );
-    let _other_server = client_a
-        .language_registry()
-        .register_specific_fake_lsp_adapter(
+        ),
+        client_a.language_registry().register_fake_lsp(
             "Rust",
-            false,
             FakeLspAdapter {
                 name: "CrabLang-ls",
                 capabilities: lsp::ServerCapabilities {
@@ -5102,7 +5101,8 @@ async fn test_lsp_hover(
                 },
                 ..FakeLspAdapter::default()
             },
-        );
+        ),
+    ];
 
     let (project_a, worktree_id) = client_a.build_local_project("/root-1", cx_a).await;
     let project_id = active_call_a
@@ -5117,7 +5117,7 @@ async fn test_lsp_hover(
 
     let mut servers_with_hover_requests = HashMap::default();
     for i in 0..language_server_names.len() {
-        let new_server = fake_language_servers.next().await.unwrap_or_else(|| {
+        let new_server = language_servers[i].next().await.unwrap_or_else(|| {
             panic!(
                 "Failed to get language server #{i} with name {}",
                 &language_server_names[i]
@@ -5262,7 +5262,7 @@ async fn test_project_symbols(
     client_a.language_registry().add(rust_lang());
     let mut fake_language_servers = client_a
         .language_registry()
-        .register_fake_lsp_adapter("Rust", Default::default());
+        .register_fake_lsp("Rust", Default::default());
 
     client_a
         .fs()
@@ -5300,9 +5300,7 @@ async fn test_project_symbols(
             lsp::SymbolInformation {
                 name: "TWO".into(),
                 location: lsp::Location {
-                    uri: lsp::Uri::from_file_path("/code/crate-2/two.rs")
-                        .unwrap()
-                        .into(),
+                    uri: lsp::Url::from_file_path("/code/crate-2/two.rs").unwrap(),
                     range: lsp::Range::new(lsp::Position::new(0, 6), lsp::Position::new(0, 9)),
                 },
                 kind: lsp::SymbolKind::CONSTANT,
@@ -5366,7 +5364,7 @@ async fn test_open_buffer_while_getting_definition_pointing_to_it(
     client_a.language_registry().add(rust_lang());
     let mut fake_language_servers = client_a
         .language_registry()
-        .register_fake_lsp_adapter("Rust", Default::default());
+        .register_fake_lsp("Rust", Default::default());
 
     client_a
         .fs()
@@ -5392,7 +5390,7 @@ async fn test_open_buffer_while_getting_definition_pointing_to_it(
     fake_language_server.handle_request::<lsp::request::GotoDefinition, _, _>(|_, _| async move {
         Ok(Some(lsp::GotoDefinitionResponse::Scalar(
             lsp::Location::new(
-                lsp::Uri::from_file_path("/root/b.rs").unwrap().into(),
+                lsp::Url::from_file_path("/root/b.rs").unwrap(),
                 lsp::Range::new(lsp::Position::new(0, 6), lsp::Position::new(0, 9)),
             ),
         )))
@@ -6193,7 +6191,7 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
     let project = workspace.update(cx, |workspace, _| workspace.project().clone());
 
     let worktree_id = project.update(cx, |project, cx| {
-        project.worktrees().next().unwrap().read(cx).id()
+        project.worktrees(cx).next().unwrap().read(cx).id()
     });
 
     let path_1 = ProjectPath {
@@ -6334,7 +6332,7 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
 
     // Close permanent tab
     pane.update(cx, |pane, cx| {
-        let id = pane.items().nth(0).unwrap().item_id();
+        let id = pane.items().next().unwrap().item_id();
         pane.close_item_by_id(id, workspace::SaveIntent::Skip, cx)
     })
     .await
@@ -6345,7 +6343,7 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
         assert_eq!(get_path(pane, 0, cx), path_1.clone());
         assert_eq!(
             pane.preview_item_id(),
-            Some(pane.items().nth(0).unwrap().item_id())
+            Some(pane.items().next().unwrap().item_id())
         );
 
         assert!(pane.can_navigate_backward());
@@ -6364,7 +6362,7 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
         assert_eq!(get_path(pane, 0, cx), path_1.clone());
         assert_eq!(
             pane.preview_item_id(),
-            Some(pane.items().nth(0).unwrap().item_id())
+            Some(pane.items().next().unwrap().item_id())
         );
 
         assert!(pane.can_navigate_backward());
@@ -6393,7 +6391,7 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
         assert_eq!(get_path(pane, 0, cx), path_1.clone());
         assert_eq!(
             pane.preview_item_id(),
-            Some(pane.items().nth(0).unwrap().item_id())
+            Some(pane.items().next().unwrap().item_id())
         );
 
         assert!(pane.can_navigate_backward());
@@ -6431,7 +6429,7 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
         assert_eq!(get_path(pane, 0, cx), path_2.clone());
         assert_eq!(
             pane.preview_item_id(),
-            Some(pane.items().nth(0).unwrap().item_id())
+            Some(pane.items().next().unwrap().item_id())
         );
 
         assert!(pane.can_navigate_backward());
@@ -6449,5 +6447,126 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
 
         assert!(pane.can_navigate_backward());
         assert!(!pane.can_navigate_forward());
+    });
+}
+
+#[gpui::test(iterations = 10)]
+async fn test_context_collaboration_with_reconnect(
+    executor: BackgroundExecutor,
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) {
+    let mut server = TestServer::start(executor.clone()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+
+    client_a.fs().insert_tree("/a", Default::default()).await;
+    let (project_a, _) = client_a.build_local_project("/a", cx_a).await;
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+    let project_b = client_b.build_dev_server_project(project_id, cx_b).await;
+
+    // Client A sees that a guest has joined.
+    executor.run_until_parked();
+
+    project_a.read_with(cx_a, |project, _| {
+        assert_eq!(project.collaborators().len(), 1);
+    });
+    project_b.read_with(cx_b, |project, _| {
+        assert_eq!(project.collaborators().len(), 1);
+    });
+
+    let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
+    let context_store_a = cx_a
+        .update(|cx| ContextStore::new(project_a.clone(), prompt_builder.clone(), cx))
+        .await
+        .unwrap();
+    let context_store_b = cx_b
+        .update(|cx| ContextStore::new(project_b.clone(), prompt_builder.clone(), cx))
+        .await
+        .unwrap();
+
+    // Client A creates a new context.
+    let context_a = context_store_a.update(cx_a, |store, cx| store.create(cx));
+    executor.run_until_parked();
+
+    // Client B retrieves host's contexts and joins one.
+    let context_b = context_store_b
+        .update(cx_b, |store, cx| {
+            let host_contexts = store.host_contexts().to_vec();
+            assert_eq!(host_contexts.len(), 1);
+            store.open_remote_context(host_contexts[0].id.clone(), cx)
+        })
+        .await
+        .unwrap();
+
+    // Host and guest make changes
+    context_a.update(cx_a, |context, cx| {
+        context.buffer().update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "Host change\n")], None, cx)
+        })
+    });
+    context_b.update(cx_b, |context, cx| {
+        context.buffer().update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "Guest change\n")], None, cx)
+        })
+    });
+    executor.run_until_parked();
+    assert_eq!(
+        context_a.read_with(cx_a, |context, cx| context.buffer().read(cx).text()),
+        "Guest change\nHost change\n"
+    );
+    assert_eq!(
+        context_b.read_with(cx_b, |context, cx| context.buffer().read(cx).text()),
+        "Guest change\nHost change\n"
+    );
+
+    // Disconnect client A and make some changes while disconnected.
+    server.disconnect_client(client_a.peer_id().unwrap());
+    server.forbid_connections();
+    context_a.update(cx_a, |context, cx| {
+        context.buffer().update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "Host offline change\n")], None, cx)
+        })
+    });
+    context_b.update(cx_b, |context, cx| {
+        context.buffer().update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "Guest offline change\n")], None, cx)
+        })
+    });
+    executor.run_until_parked();
+    assert_eq!(
+        context_a.read_with(cx_a, |context, cx| context.buffer().read(cx).text()),
+        "Host offline change\nGuest change\nHost change\n"
+    );
+    assert_eq!(
+        context_b.read_with(cx_b, |context, cx| context.buffer().read(cx).text()),
+        "Guest offline change\nGuest change\nHost change\n"
+    );
+
+    // Allow client A to reconnect and verify that contexts converge.
+    server.allow_connections();
+    executor.advance_clock(RECEIVE_TIMEOUT);
+    assert_eq!(
+        context_a.read_with(cx_a, |context, cx| context.buffer().read(cx).text()),
+        "Guest offline change\nHost offline change\nGuest change\nHost change\n"
+    );
+    assert_eq!(
+        context_b.read_with(cx_b, |context, cx| context.buffer().read(cx).text()),
+        "Guest offline change\nHost offline change\nGuest change\nHost change\n"
+    );
+
+    // Client A disconnects without being able to reconnect. Context B becomes readonly.
+    server.forbid_connections();
+    server.disconnect_client(client_a.peer_id().unwrap());
+    executor.advance_clock(RECEIVE_TIMEOUT + RECONNECT_TIMEOUT);
+    context_b.read_with(cx_b, |context, cx| {
+        assert!(context.buffer().read(cx).read_only());
     });
 }

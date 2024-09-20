@@ -25,12 +25,15 @@ if [[ -n $apt ]]; then
     libvulkan1
     libgit2-dev
     make
+    cmake
     clang
     mold
     jq
     gettext-base
     elfutils
+    libsqlite3-dev
   )
+  $maysudo "$apt" update
   $maysudo "$apt" install -y "${deps[@]}"
   exit 0
 fi
@@ -43,6 +46,7 @@ if [[ -n $dnf ]]; then
     gcc
     g++
     clang
+    cmake
     mold
     alsa-lib-devel
     fontconfig-devel
@@ -56,6 +60,7 @@ if [[ -n $dnf ]]; then
     perl-File-Compare
     perl-File-Copy
     vulkan-loader
+    sqlite-devel
   )
 
   # libxkbcommon-x11-devel is in the crb repo on RHEL and CentOS, not needed for Fedora
@@ -76,6 +81,7 @@ if [[ -n $zyp ]]; then
     gcc-c++
     clang
     make
+    cmake
     alsa-devel
     fontconfig-devel
     wayland-devel
@@ -84,6 +90,7 @@ if [[ -n $zyp ]]; then
     libzstd-devel
     libvulkan1
     mold
+    sqlite3-devel
   )
   $maysudo "$zyp" install -y "${deps[@]}"
   exit 0
@@ -96,6 +103,7 @@ if [[ -n $pacman ]]; then
   deps=(
     gcc
     clang
+    cmake
     alsa-lib
     fontconfig
     wayland
@@ -105,6 +113,8 @@ if [[ -n $pacman ]]; then
     zstd
     pkgconf
     mold
+    sqlite
+    jq
   )
   $maysudo "$pacman" -S --needed --noconfirm "${deps[@]}"
   exit 0
@@ -115,6 +125,12 @@ fi
 xbps=$(command -v xbps-install || true)
 if [[ -n $xbps ]]; then
   deps=(
+    gettext-devel
+    clang
+    cmake
+    jq
+    elfutils-devel
+    gcc
     alsa-lib-devel
     fontconfig-devel
     libxcb-devel
@@ -124,6 +140,7 @@ if [[ -n $xbps ]]; then
     wayland-devel
     vulkan-loader
     mold
+    sqlite-devel
   )
   $maysudo "$xbps" -Syu "${deps[@]}"
   exit 0
@@ -137,12 +154,14 @@ if [[ -n $emerge ]]; then
     app-arch/zstd
     dev-libs/openssl
     dev-libs/wayland
+    dev-util/cmake
     media-libs/alsa-lib
     media-libs/fontconfig
     media-libs/vulkan-loader
     x11-libs/libxcb
     x11-libs/libxkbcommon
     sys-devel/mold
+    dev-db/sqlite
   )
   $maysudo "$emerge" -u "${deps[@]}"
   exit 0

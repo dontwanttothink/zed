@@ -35,6 +35,7 @@ pub struct ListItem {
     tooltip: Option<Box<dyn Fn(&mut WindowContext) -> AnyView + 'static>>,
     on_secondary_mouse_down: Option<Box<dyn Fn(&MouseDownEvent, &mut WindowContext) + 'static>>,
     children: SmallVec<[AnyElement; 2]>,
+    selectable: bool,
 }
 
 impl ListItem {
@@ -56,11 +57,17 @@ impl ListItem {
             on_toggle: None,
             tooltip: None,
             children: SmallVec::new(),
+            selectable: true,
         }
     }
 
     pub fn spacing(mut self, spacing: ListItemSpacing) -> Self {
         self.spacing = spacing;
+        self
+    }
+
+    pub fn selectable(mut self, has_hover: bool) -> Self {
+        self.selectable = has_hover;
         self
     }
 
@@ -155,7 +162,7 @@ impl RenderOnce for ListItem {
             // When an item is inset draw the indent spacing outside of the item
             .when(self.inset, |this| {
                 this.ml(self.indent_level as f32 * self.indent_step_size)
-                    .px_2()
+                    .px(Spacing::Small.rems(cx))
             })
             .when(!self.inset && !self.disabled, |this| {
                 this
@@ -164,10 +171,12 @@ impl RenderOnce for ListItem {
                     //     this.border_1()
                     //         .border_color(cx.theme().colors().border_focused)
                     // })
-                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                    .active(|style| style.bg(cx.theme().colors().ghost_element_active))
-                    .when(self.selected, |this| {
-                        this.bg(cx.theme().colors().ghost_element_selected)
+                    .when(self.selectable, |this| {
+                        this.hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                            .active(|style| style.bg(cx.theme().colors().ghost_element_active))
+                            .when(self.selected, |this| {
+                                this.bg(cx.theme().colors().ghost_element_selected)
+                            })
                     })
             })
             .child(
@@ -176,7 +185,7 @@ impl RenderOnce for ListItem {
                     .w_full()
                     .relative()
                     .gap_1()
-                    .px_2()
+                    .px(Spacing::Medium.rems(cx))
                     .map(|this| match self.spacing {
                         ListItemSpacing::Dense => this,
                         ListItemSpacing::Sparse => this.py_1(),
@@ -189,10 +198,14 @@ impl RenderOnce for ListItem {
                             //     this.border_1()
                             //         .border_color(cx.theme().colors().border_focused)
                             // })
-                            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                            .active(|style| style.bg(cx.theme().colors().ghost_element_active))
-                            .when(self.selected, |this| {
-                                this.bg(cx.theme().colors().ghost_element_selected)
+                            .when(self.selectable, |this| {
+                                this.hover(|style| {
+                                    style.bg(cx.theme().colors().ghost_element_hover)
+                                })
+                                .active(|style| style.bg(cx.theme().colors().ghost_element_active))
+                                .when(self.selected, |this| {
+                                    this.bg(cx.theme().colors().ghost_element_selected)
+                                })
                             })
                     })
                     .when_some(self.on_click, |this, on_click| {
@@ -225,7 +238,7 @@ impl RenderOnce for ListItem {
                             .flex_grow()
                             .flex_shrink_0()
                             .flex_basis(relative(0.25))
-                            .gap_1()
+                            .gap(Spacing::Small.rems(cx))
                             .overflow_hidden()
                             .children(self.start_slot)
                             .children(self.children),
@@ -247,7 +260,7 @@ impl RenderOnce for ListItem {
                             h_flex()
                                 .h_full()
                                 .absolute()
-                                .right_2()
+                                .right(Spacing::Medium.rems(cx))
                                 .top_0()
                                 .visible_on_hover("list_item")
                                 .child(end_hover_slot),

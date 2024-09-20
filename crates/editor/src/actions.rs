@@ -1,5 +1,6 @@
 //! This module contains all actions supported by [`Editor`].
 use super::*;
+use gpui::action_as;
 use util::serde::default_true;
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
@@ -59,6 +60,12 @@ pub struct ToggleCodeActions {
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct ConfirmCompletion {
+    #[serde(default)]
+    pub item_ix: Option<usize>,
+}
+
+#[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct ComposeCompletion {
     #[serde(default)]
     pub item_ix: Option<usize>,
 }
@@ -128,18 +135,37 @@ pub struct ExpandExcerptsDown {
 #[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct ShowCompletions {
     #[serde(default)]
-    pub(super) trigger: Option<char>,
+    pub(super) trigger: Option<String>,
+}
+
+#[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct HandleInput(pub String);
+
+#[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct DeleteToNextWordEnd {
+    #[serde(default)]
+    pub ignore_newlines: bool,
+}
+
+#[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct DeleteToPreviousWordStart {
+    #[serde(default)]
+    pub ignore_newlines: bool,
 }
 
 impl_actions!(
     editor,
     [
+        ComposeCompletion,
         ConfirmCodeAction,
         ConfirmCompletion,
+        DeleteToNextWordEnd,
+        DeleteToPreviousWordStart,
         ExpandExcerpts,
-        ExpandExcerptsUp,
         ExpandExcerptsDown,
+        ExpandExcerptsUp,
         FoldAt,
+        HandleInput,
         MoveDownByLines,
         MovePageDown,
         MovePageUp,
@@ -162,13 +188,14 @@ impl_actions!(
 gpui::actions!(
     editor,
     [
-        AcceptPartialCopilotSuggestion,
         AcceptInlineCompletion,
+        AcceptPartialCopilotSuggestion,
         AcceptPartialInlineCompletion,
         AddSelectionAbove,
         AddSelectionBelow,
         Backspace,
         Cancel,
+        CancelLanguageServerWork,
         ConfirmRename,
         ContextMenuFirst,
         ContextMenuLast,
@@ -183,6 +210,7 @@ gpui::actions!(
         ConvertToUpperCamelCase,
         ConvertToUpperCase,
         Copy,
+        CopyFileLocation,
         CopyHighlightJson,
         CopyPath,
         CopyPermalinkToLine,
@@ -194,9 +222,7 @@ gpui::actions!(
         DeleteToBeginningOfLine,
         DeleteToEndOfLine,
         DeleteToNextSubwordEnd,
-        DeleteToNextWordEnd,
         DeleteToPreviousSubwordStart,
-        DeleteToPreviousWordStart,
         DisplayCursorNames,
         DuplicateLineDown,
         DuplicateLineUp,
@@ -206,6 +232,8 @@ gpui::actions!(
         Fold,
         FoldSelectedRanges,
         Format,
+        GoToDeclaration,
+        GoToDeclarationSplit,
         GoToDefinition,
         GoToDefinitionSplit,
         GoToDiagnostic,
@@ -245,6 +273,7 @@ gpui::actions!(
         NextScreen,
         OpenExcerpts,
         OpenExcerptsSplit,
+        OpenFile,
         OpenPermalinkToLine,
         OpenUrl,
         Outdent,
@@ -256,18 +285,24 @@ gpui::actions!(
         RedoSelection,
         Rename,
         RestartLanguageServer,
-        RevealInFinder,
+        RevealInFileManager,
         ReverseLines,
+        RevertFile,
         RevertSelectedHunks,
+        Rewrap,
         ScrollCursorBottom,
         ScrollCursorCenter,
+        ScrollCursorCenterTopBottom,
         ScrollCursorTop,
         SelectAll,
         SelectAllMatches,
         SelectDown,
+        SelectEnclosingSymbol,
         SelectLargerSyntaxNode,
         SelectLeft,
         SelectLine,
+        SelectPageDown,
+        SelectPageUp,
         SelectRight,
         SelectSmallerSyntaxNode,
         SelectToBeginning,
@@ -281,18 +316,24 @@ gpui::actions!(
         SelectUp,
         ShowCharacterPalette,
         ShowInlineCompletion,
+        ShowSignatureHelp,
         ShuffleLines,
         SortLinesCaseInsensitive,
         SortLinesCaseSensitive,
         SplitSelectionIntoLines,
+        SwitchSourceHeader,
         Tab,
         TabPrev,
+        ToggleAutoSignatureHelp,
         ToggleGitBlame,
         ToggleGitBlameInline,
         ToggleHunkDiff,
-        ToggleInlayHints,
-        ToggleLineNumbers,
         ToggleIndentGuides,
+        ToggleInlayHints,
+        ToggleInlineCompletions,
+        ToggleLineNumbers,
+        ToggleRelativeLineNumbers,
+        ToggleSelectionMenu,
         ToggleSoftWrap,
         ToggleTabBar,
         Transpose,
@@ -303,3 +344,7 @@ gpui::actions!(
         UniqueLinesCaseSensitive,
     ]
 );
+
+action_as!(outline, ToggleOutline as Toggle);
+
+action_as!(go_to_line, ToggleGoToLine as Toggle);

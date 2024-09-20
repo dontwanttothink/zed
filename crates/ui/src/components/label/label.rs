@@ -1,4 +1,4 @@
-use gpui::WindowContext;
+use gpui::{StyleRefinement, WindowContext};
 
 use crate::{prelude::*, LabelCommon, LabelLike, LabelSize, LineHeightStyle};
 
@@ -70,6 +70,17 @@ impl Label {
     }
 }
 
+// Style methods.
+impl Label {
+    fn style(&mut self) -> &mut StyleRefinement {
+        self.base.base.style()
+    }
+
+    gpui::margin_style_methods!({
+        visibility: pub
+    });
+}
+
 impl LabelCommon for Label {
     /// Sets the size of the label using a [`LabelSize`].
     ///
@@ -82,6 +93,11 @@ impl LabelCommon for Label {
     /// ```
     fn size(mut self, size: LabelSize) -> Self {
         self.base = self.base.size(size);
+        self
+    }
+
+    fn weight(mut self, weight: gpui::FontWeight) -> Self {
+        self.base = self.base.weight(weight);
         self
     }
 
@@ -138,6 +154,25 @@ impl LabelCommon for Label {
     /// ```
     fn italic(mut self, italic: bool) -> Self {
         self.base = self.base.italic(italic);
+        self
+    }
+
+    /// Sets the alpha property of the color of label.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ui::prelude::*;
+    ///
+    /// let my_label = Label::new("Hello, World!").alpha(0.5);
+    /// ```
+    fn alpha(mut self, alpha: f32) -> Self {
+        self.base = self.base.alpha(alpha);
+        self
+    }
+
+    fn underline(mut self, underline: bool) -> Self {
+        self.base = self.base.underline(underline);
         self
     }
 }

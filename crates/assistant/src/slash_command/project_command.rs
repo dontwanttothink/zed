@@ -1,16 +1,16 @@
 use super::{SlashCommand, SlashCommandOutput};
 use anyhow::{anyhow, Context, Result};
-use assistant_slash_command::SlashCommandOutputSection;
+use assistant_slash_command::{ArgumentCompletion, SlashCommandOutputSection};
 use fs::Fs;
 use gpui::{AppContext, Model, Task, WeakView};
-use language::LspAdapterDelegate;
+use language::{BufferSnapshot, LspAdapterDelegate};
 use project::{Project, ProjectPath};
 use std::{
     fmt::Write,
     path::Path,
     sync::{atomic::AtomicBool, Arc},
 };
-use ui::{prelude::*, ButtonLike, ElevationIndex};
+use ui::prelude::*;
 use workspace::Workspace;
 
 pub(crate) struct ProjectSlashCommand;
@@ -75,7 +75,7 @@ impl ProjectSlashCommand {
     }
 
     fn path_to_cargo_toml(project: Model<Project>, cx: &mut AppContext) -> Option<Arc<Path>> {
-        let worktree = project.read(cx).worktrees().next()?;
+        let worktree = project.read(cx).worktrees(cx).next()?;
         let worktree = worktree.read(cx);
         let entry = worktree.entry_for_path("Cargo.toml")?;
         let path = ProjectPath {
@@ -102,12 +102,12 @@ impl SlashCommand for ProjectSlashCommand {
     }
 
     fn complete_argument(
-        &self,
-        _query: String,
+        self: Arc<Self>,
+        _arguments: &[String],
         _cancel: Arc<AtomicBool>,
         _workspace: Option<WeakView<Workspace>>,
-        _cx: &mut AppContext,
-    ) -> Task<Result<Vec<String>>> {
+        _cx: &mut WindowContext,
+    ) -> Task<Result<Vec<ArgumentCompletion>>> {
         Task::ready(Err(anyhow!("this command does not require argument")))
     }
 
@@ -117,9 +117,11 @@ impl SlashCommand for ProjectSlashCommand {
 
     fn run(
         self: Arc<Self>,
-        _argument: Option<&str>,
+        _arguments: &[String],
+        _context_slash_command_output_sections: &[SlashCommandOutputSection<language::Anchor>],
+        _context_buffer: BufferSnapshot,
         workspace: WeakView<Workspace>,
-        _delegate: Arc<dyn LspAdapterDelegate>,
+        _delegate: Option<Arc<dyn LspAdapterDelegate>>,
         cx: &mut WindowContext,
     ) -> Task<Result<SlashCommandOutput>> {
         let output = workspace.update(cx, |workspace, cx| {
@@ -138,15 +140,9 @@ impl SlashCommand for ProjectSlashCommand {
                     text,
                     sections: vec![SlashCommandOutputSection {
                         range,
-                        render_placeholder: Arc::new(move |id, unfold, _cx| {
-                            ButtonLike::new(id)
-                                .style(ButtonStyle::Filled)
-                                .layer(ElevationIndex::ElevatedSurface)
-                                .child(Icon::new(IconName::FileTree))
-                                .child(Label::new("Project"))
-                                .on_click(move |_, cx| unfold(cx))
-                                .into_any_element()
-                        }),
+                        icon: IconName::FileTree,
+                        label: "Project".into(),
+                        metadata: None,
                     }],
                     run_commands_in_text: false,
                 })

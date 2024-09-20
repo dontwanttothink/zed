@@ -1,4 +1,3 @@
-use anyhow;
 use gpui::Pixels;
 use schemars::JsonSchema;
 use serde_derive::{Deserialize, Serialize};
@@ -22,6 +21,36 @@ pub struct ProjectPanelSettings {
     pub indent_size: f32,
     pub auto_reveal_entries: bool,
     pub auto_fold_dirs: bool,
+    pub scrollbar: ScrollbarSettings,
+}
+
+/// When to show the scrollbar in the project panel.
+///
+/// Default: always
+#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowScrollbar {
+    #[default]
+    /// Always show the scrollbar.
+    Always,
+    /// Never show the scrollbar.
+    Never,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ScrollbarSettings {
+    /// When to show the scrollbar in the project panel.
+    ///
+    /// Default: always
+    pub show: ShowScrollbar,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ScrollbarSettingsContent {
+    /// When to show the scrollbar in the project panel.
+    ///
+    /// Default: always
+    pub show: Option<ShowScrollbar>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema, Debug)]
@@ -30,7 +59,7 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: true
     pub button: Option<bool>,
-    /// Customise default width (in pixels) taken by project panel
+    /// Customize default width (in pixels) taken by project panel
     ///
     /// Default: 240
     pub default_width: Option<f32>,
@@ -65,6 +94,8 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: false
     pub auto_fold_dirs: Option<bool>,
+    /// Scrollbar-related settings
+    pub scrollbar: Option<ScrollbarSettingsContent>,
 }
 
 impl Settings for ProjectPanelSettings {

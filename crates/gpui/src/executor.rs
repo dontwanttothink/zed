@@ -13,7 +13,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use util::TryFutureExt;
 use waker_fn::waker_fn;
@@ -210,10 +210,10 @@ impl BackgroundExecutor {
                 Poll::Pending => {
                     let timeout =
                         deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-                    if !self.dispatcher.park(timeout) {
-                        if deadline.is_some_and(|deadline| deadline < Instant::now()) {
-                            return Err(future);
-                        }
+                    if !self.dispatcher.park(timeout)
+                        && deadline.is_some_and(|deadline| deadline < Instant::now())
+                    {
+                        return Err(future);
                     }
                 }
             }
@@ -314,6 +314,14 @@ impl BackgroundExecutor {
         for task in spawned {
             task.await;
         }
+    }
+
+    /// Get the current time.
+    ///
+    /// Calling this instead of `std::time::Instant::now` allows the use
+    /// of fake timers in tests.
+    pub fn now(&self) -> Instant {
+        self.dispatcher.now()
     }
 
     /// Returns a task that will complete after the given duration.

@@ -25,8 +25,9 @@ pub fn marked_display_snapshot(
     let (unmarked_text, markers) = marked_text_offsets(text);
 
     let font = Font {
-        family: "Zed Mono".into(),
+        family: "Zed Plex Mono".into(),
         features: FontFeatures::default(),
+        fallbacks: None,
         weight: FontWeight::default(),
         style: FontStyle::default(),
     };
@@ -62,6 +63,7 @@ pub fn select_ranges(editor: &mut Editor, marked_text: &str, cx: &mut ViewContex
     editor.change_selections(None, cx, |s| s.select_ranges(text_ranges));
 }
 
+#[track_caller]
 pub fn assert_text_with_selections(
     editor: &mut Editor,
     marked_text: &str,

@@ -16,6 +16,7 @@ use settings::SettingsStore;
 use std::{
     env,
     ops::Range,
+    sync::LazyLock,
     time::{Duration, Instant},
 };
 use text::network::Network;
@@ -24,12 +25,12 @@ use text::{Point, ToPoint};
 use unindent::Unindent as _;
 use util::{assert_set_eq, post_inc, test::marked_text_ranges, RandomCharIter};
 
-lazy_static! {
-    static ref TRAILING_WHITESPACE_REGEX: Regex = RegexBuilder::new("[ \t]+$")
+pub static TRAILING_WHITESPACE_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
+    RegexBuilder::new(r"[ \t]+$")
         .multi_line(true)
         .build()
-        .unwrap();
-}
+        .expect("Failed to create TRAILING_WHITESPACE_REGEX")
+});
 
 #[cfg(test)]
 #[ctor::ctor]
@@ -71,40 +72,38 @@ fn test_select_language(cx: &mut AppContext) {
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
     registry.add(Arc::new(Language::new(
         LanguageConfig {
-            name: "Rust".into(),
+            name: LanguageName::new("Rust"),
             matcher: LanguageMatcher {
                 path_suffixes: vec!["rs".to_string()],
                 ..Default::default()
             },
             ..Default::default()
         },
-        Some(tree_sitter_rust::language()),
+        Some(tree_sitter_rust::LANGUAGE.into()),
     )));
     registry.add(Arc::new(Language::new(
         LanguageConfig {
-            name: "Make".into(),
+            name: LanguageName::new("Make"),
             matcher: LanguageMatcher {
                 path_suffixes: vec!["Makefile".to_string(), "mk".to_string()],
                 ..Default::default()
             },
             ..Default::default()
         },
-        Some(tree_sitter_rust::language()),
+        Some(tree_sitter_rust::LANGUAGE.into()),
     )));
 
     // matching file extension
     assert_eq!(
         registry
             .language_for_file(&file("src/lib.rs"), None, cx)
-            .now_or_never()
-            .and_then(|l| Some(l.ok()?.name())),
+            .map(|l| l.name()),
         Some("Rust".into())
     );
     assert_eq!(
         registry
             .language_for_file(&file("src/lib.mk"), None, cx)
-            .now_or_never()
-            .and_then(|l| Some(l.ok()?.name())),
+            .map(|l| l.name()),
         Some("Make".into())
     );
 
@@ -112,8 +111,7 @@ fn test_select_language(cx: &mut AppContext) {
     assert_eq!(
         registry
             .language_for_file(&file("src/Makefile"), None, cx)
-            .now_or_never()
-            .and_then(|l| Some(l.ok()?.name())),
+            .map(|l| l.name()),
         Some("Make".into())
     );
 
@@ -121,22 +119,19 @@ fn test_select_language(cx: &mut AppContext) {
     assert_eq!(
         registry
             .language_for_file(&file("zed/cars"), None, cx)
-            .now_or_never()
-            .and_then(|l| Some(l.ok()?.name())),
+            .map(|l| l.name()),
         None
     );
     assert_eq!(
         registry
             .language_for_file(&file("zed/a.cars"), None, cx)
-            .now_or_never()
-            .and_then(|l| Some(l.ok()?.name())),
+            .map(|l| l.name()),
         None
     );
     assert_eq!(
         registry
             .language_for_file(&file("zed/sumk"), None, cx)
-            .now_or_never()
-            .and_then(|l| Some(l.ok()?.name())),
+            .map(|l| l.name()),
         None
     );
 }
@@ -157,23 +152,22 @@ async fn test_first_line_pattern(cx: &mut TestAppContext) {
         ..Default::default()
     });
 
-    cx.read(|cx| languages.language_for_file(&file("the/script"), None, cx))
-        .await
-        .unwrap_err();
-    cx.read(|cx| languages.language_for_file(&file("the/script"), Some(&"nothing".into()), cx))
-        .await
-        .unwrap_err();
+    assert!(cx
+        .read(|cx| languages.language_for_file(&file("the/script"), None, cx))
+        .is_none());
+    assert!(cx
+        .read(|cx| languages.language_for_file(&file("the/script"), Some(&"nothing".into()), cx))
+        .is_none());
+
     assert_eq!(
         cx.read(|cx| languages.language_for_file(
             &file("the/script"),
             Some(&"#!/bin/env node".into()),
             cx
         ))
-        .await
         .unwrap()
-        .name()
-        .as_ref(),
-        "JavaScript"
+        .name(),
+        "JavaScript".into()
     );
 }
 
@@ -241,19 +235,16 @@ async fn test_language_for_file_with_custom_file_types(cx: &mut TestAppContext) 
 
     let language = cx
         .read(|cx| languages.language_for_file(&file("foo.js"), None, cx))
-        .await
         .unwrap();
-    assert_eq!(language.name().as_ref(), "TypeScript");
+    assert_eq!(language.name(), "TypeScript".into());
     let language = cx
         .read(|cx| languages.language_for_file(&file("foo.c"), None, cx))
-        .await
         .unwrap();
-    assert_eq!(language.name().as_ref(), "C++");
+    assert_eq!(language.name(), "C++".into());
     let language = cx
         .read(|cx| languages.language_for_file(&file("Dockerfile.dev"), None, cx))
-        .await
         .unwrap();
-    assert_eq!(language.name().as_ref(), "Dockerfile");
+    assert_eq!(language.name(), "Dockerfile".into());
 }
 
 fn file(path: &str) -> Arc<dyn File> {
@@ -284,7 +275,7 @@ fn test_edit_events(cx: &mut gpui::AppContext) {
         |buffer, cx| {
             let buffer_1_events = buffer_1_events.clone();
             cx.subscribe(&buffer1, move |_, _, event, _| match event.clone() {
-                Event::Operation(op) => buffer1_ops.lock().push(op),
+                BufferEvent::Operation(op) => buffer1_ops.lock().push(op),
                 event => buffer_1_events.lock().push(event),
             })
             .detach();
@@ -317,20 +308,20 @@ fn test_edit_events(cx: &mut gpui::AppContext) {
     // Incorporating a set of remote ops emits a single edited event,
     // followed by a dirty changed event.
     buffer2.update(cx, |buffer, cx| {
-        buffer.apply_ops(buffer1_ops.lock().drain(..), cx).unwrap();
+        buffer.apply_ops(buffer1_ops.lock().drain(..), cx);
     });
     assert_eq!(
         mem::take(&mut *buffer_1_events.lock()),
         vec![
-            Event::Edited,
-            Event::DirtyChanged,
-            Event::Edited,
-            Event::Edited,
+            BufferEvent::Edited,
+            BufferEvent::DirtyChanged,
+            BufferEvent::Edited,
+            BufferEvent::Edited,
         ]
     );
     assert_eq!(
         mem::take(&mut *buffer_2_events.lock()),
-        vec![Event::Edited, Event::DirtyChanged]
+        vec![BufferEvent::Edited, BufferEvent::DirtyChanged]
     );
 
     buffer1.update(cx, |buffer, cx| {
@@ -341,15 +332,15 @@ fn test_edit_events(cx: &mut gpui::AppContext) {
     // Incorporating the remote ops again emits a single edited event,
     // followed by a dirty changed event.
     buffer2.update(cx, |buffer, cx| {
-        buffer.apply_ops(buffer1_ops.lock().drain(..), cx).unwrap();
+        buffer.apply_ops(buffer1_ops.lock().drain(..), cx);
     });
     assert_eq!(
         mem::take(&mut *buffer_1_events.lock()),
-        vec![Event::Edited, Event::DirtyChanged,]
+        vec![BufferEvent::Edited, BufferEvent::DirtyChanged,]
     );
     assert_eq!(
         mem::take(&mut *buffer_2_events.lock()),
-        vec![Event::Edited, Event::DirtyChanged]
+        vec![BufferEvent::Edited, BufferEvent::DirtyChanged]
     );
 }
 
@@ -391,7 +382,7 @@ async fn test_normalize_whitespace(cx: &mut gpui::TestAppContext) {
     let buffer = cx.new_model(|cx| Buffer::local(text, cx));
 
     // Spawn a task to format the buffer's whitespace.
-    // Pause so that the foratting task starts running.
+    // Pause so that the formatting task starts running.
     let format = buffer.update(cx, |buffer, cx| buffer.remove_trailing_whitespace(cx));
     smol::future::yield_now().await;
 
@@ -772,6 +763,61 @@ async fn test_outline_with_extra_context(cx: &mut gpui::TestAppContext) {
             .map(|item| (item.text.as_str(), item.depth))
             .collect::<Vec<_>>(),
         &[("function a", 0)]
+    );
+}
+
+#[gpui::test]
+fn test_outline_annotations(cx: &mut AppContext) {
+    // Add this new test case
+    let text = r#"
+        /// This is a doc comment
+        /// that spans multiple lines
+        fn annotated_function() {
+            // This is not an annotation
+        }
+
+        // This is a single-line annotation
+        fn another_function() {}
+
+        fn unannotated_function() {}
+
+        // This comment is not an annotation
+
+        fn function_after_blank_line() {}
+    "#
+    .unindent();
+
+    let buffer =
+        cx.new_model(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
+    let outline = buffer
+        .update(cx, |buffer, _| buffer.snapshot().outline(None))
+        .unwrap();
+
+    assert_eq!(
+        outline
+            .items
+            .into_iter()
+            .map(|item| (
+                item.text,
+                item.depth,
+                item.annotation_range
+                    .map(|range| { buffer.read(cx).text_for_range(range).collect::<String>() })
+            ))
+            .collect::<Vec<_>>(),
+        &[
+            (
+                "fn annotated_function".to_string(),
+                0,
+                Some("/// This is a doc comment\n/// that spans multiple lines".to_string())
+            ),
+            (
+                "fn another_function".to_string(),
+                0,
+                Some("// This is a single-line annotation".to_string())
+            ),
+            ("fn unannotated_function".to_string(), 0, None),
+            ("fn function_after_blank_line".to_string(), 0, None),
+        ]
     );
 }
 
@@ -1625,7 +1671,7 @@ fn test_autoindent_language_without_indents_query(cx: &mut AppContext) {
                     auto_indent_using_last_non_empty_line: false,
                     ..Default::default()
                 },
-                Some(tree_sitter_json::language()),
+                Some(tree_sitter_json::LANGUAGE.into()),
             )),
             cx,
         );
@@ -1768,6 +1814,149 @@ fn test_autoindent_query_with_outdent_captures(cx: &mut AppContext) {
 }
 
 #[gpui::test]
+async fn test_async_autoindents_preserve_preview(cx: &mut TestAppContext) {
+    cx.update(|cx| init_settings(cx, |_| {}));
+
+    // First we insert some newlines to request an auto-indent (asynchronously).
+    // Then we request that a preview tab be preserved for the new version, even though it's edited.
+    let buffer = cx.new_model(|cx| {
+        let text = "fn a() {}";
+        let mut buffer = Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx);
+
+        // This causes autoindent to be async.
+        buffer.set_sync_parse_timeout(Duration::ZERO);
+
+        buffer.edit([(8..8, "\n\n")], Some(AutoindentMode::EachLine), cx);
+        buffer.refresh_preview();
+
+        // Synchronously, we haven't auto-indented and we're still preserving the preview.
+        assert_eq!(buffer.text(), "fn a() {\n\n}");
+        assert!(buffer.preserve_preview());
+        buffer
+    });
+
+    // Now let the autoindent finish
+    cx.executor().run_until_parked();
+
+    // The auto-indent applied, but didn't dismiss our preview
+    buffer.update(cx, |buffer, cx| {
+        assert_eq!(buffer.text(), "fn a() {\n    \n}");
+        assert!(buffer.preserve_preview());
+
+        // Edit inserting another line. It will autoindent async.
+        // Then refresh the preview version.
+        buffer.edit(
+            [(Point::new(1, 4)..Point::new(1, 4), "\n")],
+            Some(AutoindentMode::EachLine),
+            cx,
+        );
+        buffer.refresh_preview();
+        assert_eq!(buffer.text(), "fn a() {\n    \n\n}");
+        assert!(buffer.preserve_preview());
+
+        // Then perform another edit, this time without refreshing the preview version.
+        buffer.edit([(Point::new(1, 4)..Point::new(1, 4), "x")], None, cx);
+        // This causes the preview to not be preserved.
+        assert!(!buffer.preserve_preview());
+    });
+
+    // Let the async autoindent from the first edit finish.
+    cx.executor().run_until_parked();
+
+    // The autoindent applies, but it shouldn't restore the preview status because we had an edit in the meantime.
+    buffer.update(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "fn a() {\n    x\n    \n}");
+        assert!(!buffer.preserve_preview());
+    });
+}
+
+#[gpui::test]
+fn test_insert_empty_line(cx: &mut AppContext) {
+    init_settings(cx, |_| {});
+
+    // Insert empty line at the beginning, requesting an empty line above
+    cx.new_model(|cx| {
+        let mut buffer = Buffer::local("abc\ndef\nghi", cx);
+        let point = buffer.insert_empty_line(Point::new(0, 0), true, false, cx);
+        assert_eq!(buffer.text(), "\nabc\ndef\nghi");
+        assert_eq!(point, Point::new(0, 0));
+        buffer
+    });
+
+    // Insert empty line at the beginning, requesting an empty line above and below
+    cx.new_model(|cx| {
+        let mut buffer = Buffer::local("abc\ndef\nghi", cx);
+        let point = buffer.insert_empty_line(Point::new(0, 0), true, true, cx);
+        assert_eq!(buffer.text(), "\n\nabc\ndef\nghi");
+        assert_eq!(point, Point::new(0, 0));
+        buffer
+    });
+
+    // Insert empty line at the start of a line, requesting empty lines above and below
+    cx.new_model(|cx| {
+        let mut buffer = Buffer::local("abc\ndef\nghi", cx);
+        let point = buffer.insert_empty_line(Point::new(2, 0), true, true, cx);
+        assert_eq!(buffer.text(), "abc\ndef\n\n\n\nghi");
+        assert_eq!(point, Point::new(3, 0));
+        buffer
+    });
+
+    // Insert empty line in the middle of a line, requesting empty lines above and below
+    cx.new_model(|cx| {
+        let mut buffer = Buffer::local("abc\ndefghi\njkl", cx);
+        let point = buffer.insert_empty_line(Point::new(1, 3), true, true, cx);
+        assert_eq!(buffer.text(), "abc\ndef\n\n\n\nghi\njkl");
+        assert_eq!(point, Point::new(3, 0));
+        buffer
+    });
+
+    // Insert empty line in the middle of a line, requesting empty line above only
+    cx.new_model(|cx| {
+        let mut buffer = Buffer::local("abc\ndefghi\njkl", cx);
+        let point = buffer.insert_empty_line(Point::new(1, 3), true, false, cx);
+        assert_eq!(buffer.text(), "abc\ndef\n\n\nghi\njkl");
+        assert_eq!(point, Point::new(3, 0));
+        buffer
+    });
+
+    // Insert empty line in the middle of a line, requesting empty line below only
+    cx.new_model(|cx| {
+        let mut buffer = Buffer::local("abc\ndefghi\njkl", cx);
+        let point = buffer.insert_empty_line(Point::new(1, 3), false, true, cx);
+        assert_eq!(buffer.text(), "abc\ndef\n\n\nghi\njkl");
+        assert_eq!(point, Point::new(2, 0));
+        buffer
+    });
+
+    // Insert empty line at the end, requesting empty lines above and below
+    cx.new_model(|cx| {
+        let mut buffer = Buffer::local("abc\ndef\nghi", cx);
+        let point = buffer.insert_empty_line(Point::new(2, 3), true, true, cx);
+        assert_eq!(buffer.text(), "abc\ndef\nghi\n\n\n");
+        assert_eq!(point, Point::new(4, 0));
+        buffer
+    });
+
+    // Insert empty line at the end, requesting empty line above only
+    cx.new_model(|cx| {
+        let mut buffer = Buffer::local("abc\ndef\nghi", cx);
+        let point = buffer.insert_empty_line(Point::new(2, 3), true, false, cx);
+        assert_eq!(buffer.text(), "abc\ndef\nghi\n\n");
+        assert_eq!(point, Point::new(4, 0));
+        buffer
+    });
+
+    // Insert empty line at the end, requesting empty line below only
+    cx.new_model(|cx| {
+        let mut buffer = Buffer::local("abc\ndef\nghi", cx);
+        let point = buffer.insert_empty_line(Point::new(2, 3), false, true, cx);
+        assert_eq!(buffer.text(), "abc\ndef\nghi\n\n");
+        assert_eq!(point, Point::new(3, 0));
+        buffer
+    });
+}
+
+#[gpui::test]
 fn test_language_scope_at_with_javascript(cx: &mut AppContext) {
     init_settings(cx, |_| {});
 
@@ -1782,12 +1971,14 @@ fn test_language_scope_at_with_javascript(cx: &mut AppContext) {
                             start: "{".into(),
                             end: "}".into(),
                             close: true,
+                            surround: true,
                             newline: false,
                         },
                         BracketPair {
                             start: "'".into(),
                             end: "'".into(),
                             close: true,
+                            surround: true,
                             newline: false,
                         },
                     ],
@@ -1808,7 +1999,7 @@ fn test_language_scope_at_with_javascript(cx: &mut AppContext) {
                 .collect(),
                 ..Default::default()
             },
-            Some(tree_sitter_typescript::language_tsx()),
+            Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         )
         .with_override_query(
             r#"
@@ -1856,11 +2047,13 @@ fn test_language_scope_at_with_javascript(cx: &mut AppContext) {
         let element_config = snapshot
             .language_scope_at(text.find("<F>").unwrap())
             .unwrap();
-        assert_eq!(element_config.line_comment_prefixes(), &[]);
-        assert_eq!(
-            element_config.block_comment_delimiters(),
-            Some((&"{/*".into(), &"*/}".into()))
-        );
+        // TODO nested blocks after newlines are captured with all whitespaces
+        // https://github.com/tree-sitter/tree-sitter-typescript/issues/306
+        // assert_eq!(element_config.line_comment_prefixes(), &[]);
+        // assert_eq!(
+        //     element_config.block_comment_delimiters(),
+        //     Some((&"{/*".into(), &"*/}".into()))
+        // );
         assert_eq!(
             element_config.brackets().map(|e| e.1).collect::<Vec<_>>(),
             &[true, true]
@@ -1910,12 +2103,14 @@ fn test_language_scope_at_with_rust(cx: &mut AppContext) {
                             start: "{".into(),
                             end: "}".into(),
                             close: true,
+                            surround: true,
                             newline: false,
                         },
                         BracketPair {
                             start: "'".into(),
                             end: "'".into(),
                             close: true,
+                            surround: true,
                             newline: false,
                         },
                     ],
@@ -1926,7 +2121,7 @@ fn test_language_scope_at_with_rust(cx: &mut AppContext) {
                 },
                 ..Default::default()
             },
-            Some(tree_sitter_rust::language()),
+            Some(tree_sitter_rust::LANGUAGE.into()),
         )
         .with_override_query(
             r#"
@@ -2012,6 +2207,45 @@ fn test_language_scope_at_with_combined_injections(cx: &mut AppContext) {
 }
 
 #[gpui::test]
+fn test_language_at_with_hidden_languages(cx: &mut AppContext) {
+    init_settings(cx, |_| {});
+
+    cx.new_model(|cx| {
+        let text = r#"
+            this is an *emphasized* word.
+        "#
+        .unindent();
+
+        let language_registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+        language_registry.add(Arc::new(markdown_lang()));
+        language_registry.add(Arc::new(markdown_inline_lang()));
+
+        let mut buffer = Buffer::local(text, cx);
+        buffer.set_language_registry(language_registry.clone());
+        buffer.set_language(
+            language_registry
+                .language_for_name("Markdown")
+                .now_or_never()
+                .unwrap()
+                .ok(),
+            cx,
+        );
+
+        let snapshot = buffer.snapshot();
+
+        for point in [Point::new(0, 4), Point::new(0, 16)] {
+            let config = snapshot.language_scope_at(point).unwrap();
+            assert_eq!(config.language_name(), "Markdown".into());
+
+            let language = snapshot.language_at(point).unwrap();
+            assert_eq!(language.name().0.as_ref(), "Markdown");
+        }
+
+        buffer
+    });
+}
+
+#[gpui::test]
 fn test_serialization(cx: &mut gpui::AppContext) {
     let mut now = Instant::now();
 
@@ -2034,19 +2268,17 @@ fn test_serialization(cx: &mut gpui::AppContext) {
     });
     assert_eq!(buffer1.read(cx).text(), "abcDF");
 
-    let state = buffer1.read(cx).to_proto();
+    let state = buffer1.read(cx).to_proto(cx);
     let ops = cx
         .background_executor()
         .block(buffer1.read(cx).serialize_ops(None, cx));
     let buffer2 = cx.new_model(|cx| {
         let mut buffer = Buffer::from_proto(1, Capability::ReadWrite, state, None).unwrap();
-        buffer
-            .apply_ops(
-                ops.into_iter()
-                    .map(|op| proto::deserialize_operation(op).unwrap()),
-                cx,
-            )
-            .unwrap();
+        buffer.apply_ops(
+            ops.into_iter()
+                .map(|op| proto::deserialize_operation(op).unwrap()),
+            cx,
+        );
         buffer
     });
     assert_eq!(buffer2.read(cx).text(), "abcDF");
@@ -2161,23 +2393,21 @@ fn test_random_collaboration(cx: &mut AppContext, mut rng: StdRng) {
 
     for i in 0..rng.gen_range(min_peers..=max_peers) {
         let buffer = cx.new_model(|cx| {
-            let state = base_buffer.read(cx).to_proto();
+            let state = base_buffer.read(cx).to_proto(cx);
             let ops = cx
                 .background_executor()
                 .block(base_buffer.read(cx).serialize_ops(None, cx));
             let mut buffer =
                 Buffer::from_proto(i as ReplicaId, Capability::ReadWrite, state, None).unwrap();
-            buffer
-                .apply_ops(
-                    ops.into_iter()
-                        .map(|op| proto::deserialize_operation(op).unwrap()),
-                    cx,
-                )
-                .unwrap();
+            buffer.apply_ops(
+                ops.into_iter()
+                    .map(|op| proto::deserialize_operation(op).unwrap()),
+                cx,
+            );
             buffer.set_group_interval(Duration::from_millis(rng.gen_range(0..=200)));
             let network = network.clone();
             cx.subscribe(&cx.handle(), move |buffer, _, event, _| {
-                if let Event::Operation(op) = event {
+                if let BufferEvent::Operation(op) = event {
                     network
                         .lock()
                         .broadcast(buffer.replica_id(), vec![proto::serialize_operation(op)]);
@@ -2268,7 +2498,7 @@ fn test_random_collaboration(cx: &mut AppContext, mut rng: StdRng) {
                 mutation_count -= 1;
             }
             50..=59 if replica_ids.len() < max_peers => {
-                let old_buffer_state = buffer.read(cx).to_proto();
+                let old_buffer_state = buffer.read(cx).to_proto(cx);
                 let old_buffer_ops = cx
                     .background_executor()
                     .block(buffer.read(cx).serialize_ops(None, cx));
@@ -2289,14 +2519,12 @@ fn test_random_collaboration(cx: &mut AppContext, mut rng: StdRng) {
                         None,
                     )
                     .unwrap();
-                    new_buffer
-                        .apply_ops(
-                            old_buffer_ops
-                                .into_iter()
-                                .map(|op| deserialize_operation(op).unwrap()),
-                            cx,
-                        )
-                        .unwrap();
+                    new_buffer.apply_ops(
+                        old_buffer_ops
+                            .into_iter()
+                            .map(|op| deserialize_operation(op).unwrap()),
+                        cx,
+                    );
                     log::info!(
                         "New replica {} text: {:?}",
                         new_buffer.replica_id(),
@@ -2305,7 +2533,7 @@ fn test_random_collaboration(cx: &mut AppContext, mut rng: StdRng) {
                     new_buffer.set_group_interval(Duration::from_millis(rng.gen_range(0..=200)));
                     let network = network.clone();
                     cx.subscribe(&cx.handle(), move |buffer, _, event, _| {
-                        if let Event::Operation(op) = event {
+                        if let BufferEvent::Operation(op) = event {
                             network.lock().broadcast(
                                 buffer.replica_id(),
                                 vec![proto::serialize_operation(op)],
@@ -2336,7 +2564,7 @@ fn test_random_collaboration(cx: &mut AppContext, mut rng: StdRng) {
                                 ops
                             );
                             new_buffer.update(cx, |new_buffer, cx| {
-                                new_buffer.apply_ops(ops, cx).unwrap();
+                                new_buffer.apply_ops(ops, cx);
                             });
                         }
                     }
@@ -2364,7 +2592,7 @@ fn test_random_collaboration(cx: &mut AppContext, mut rng: StdRng) {
                         ops.len(),
                         ops
                     );
-                    buffer.update(cx, |buffer, cx| buffer.apply_ops(ops, cx).unwrap());
+                    buffer.update(cx, |buffer, cx| buffer.apply_ops(ops, cx));
                 }
             }
             _ => {}
@@ -2412,7 +2640,7 @@ fn test_random_collaboration(cx: &mut AppContext, mut rng: StdRng) {
     for buffer in &buffers {
         let buffer = buffer.read(cx).snapshot();
         let actual_remote_selections = buffer
-            .remote_selections_in_range(Anchor::MIN..Anchor::MAX)
+            .selections_in_range(Anchor::MIN..Anchor::MAX, false)
             .map(|(replica_id, _, _, selections)| (replica_id, selections.collect::<Vec<_>>()))
             .collect::<Vec<_>>();
         let expected_remote_selections = active_selections
@@ -2457,7 +2685,7 @@ fn test_trailing_whitespace_ranges(mut rng: StdRng) {
             text.push(match rng.gen_range(0..10) {
                 0..=1 => ' ',
                 3 => '\t',
-                _ => rng.gen_range('a'..'z'),
+                _ => rng.gen_range('a'..='z'),
             });
         }
         text.push('\n');
@@ -2497,7 +2725,7 @@ fn ruby_lang() -> Language {
             line_comments: vec!["# ".into()],
             ..Default::default()
         },
-        Some(tree_sitter_ruby::language()),
+        Some(tree_sitter_ruby::LANGUAGE.into()),
     )
     .with_indents_query(
         r#"
@@ -2513,7 +2741,7 @@ fn ruby_lang() -> Language {
 fn html_lang() -> Language {
     Language::new(
         LanguageConfig {
-            name: "HTML".into(),
+            name: LanguageName::new("HTML"),
             block_comment: Some(("<!--".into(), "-->".into())),
             ..Default::default()
         },
@@ -2548,7 +2776,7 @@ fn erb_lang() -> Language {
             block_comment: Some(("<%#".into(), "%>".into())),
             ..Default::default()
         },
-        Some(tree_sitter_embedded_template::language()),
+        Some(tree_sitter_embedded_template::LANGUAGE.into()),
     )
     .with_injection_query(
         r#"
@@ -2578,7 +2806,7 @@ fn rust_lang() -> Language {
             },
             ..Default::default()
         },
-        Some(tree_sitter_rust::language()),
+        Some(tree_sitter_rust::LANGUAGE.into()),
     )
     .with_indents_query(
         r#"
@@ -2597,6 +2825,8 @@ fn rust_lang() -> Language {
     .unwrap()
     .with_outline_query(
         r#"
+        (line_comment) @annotation
+
         (struct_item
             "struct" @context
             name: (_) @name) @item
@@ -2611,7 +2841,8 @@ fn rust_lang() -> Language {
             "impl" @context
             trait: (_)? @name
             "for"? @context
-            type: (_) @name) @item
+            type: (_) @name
+            body: (_ "{" (_)* "}")) @item
         (function_item
             "fn" @context
             name: (_) @name) @item
@@ -2633,7 +2864,7 @@ fn json_lang() -> Language {
             },
             ..Default::default()
         },
-        Some(tree_sitter_json::language()),
+        Some(tree_sitter_json::LANGUAGE.into()),
     )
 }
 
@@ -2643,7 +2874,7 @@ fn javascript_lang() -> Language {
             name: "JavaScript".into(),
             ..Default::default()
         },
-        Some(tree_sitter_typescript::language_tsx()),
+        Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
     )
     .with_brackets_query(
         r#"
@@ -2657,6 +2888,45 @@ fn javascript_lang() -> Language {
         (object "}" @end) @indent
         "#,
     )
+    .unwrap()
+}
+
+pub fn markdown_lang() -> Language {
+    Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["md".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Some(tree_sitter_md::LANGUAGE.into()),
+    )
+    .with_injection_query(
+        r#"
+            (fenced_code_block
+                (info_string
+                    (language) @language)
+                (code_fence_content) @content)
+
+            ((inline) @content
+                (#set! "language" "markdown-inline"))
+        "#,
+    )
+    .unwrap()
+}
+
+pub fn markdown_inline_lang() -> Language {
+    Language::new(
+        LanguageConfig {
+            name: "Markdown-Inline".into(),
+            hidden: true,
+            ..LanguageConfig::default()
+        },
+        Some(tree_sitter_md::INLINE_LANGUAGE.into()),
+    )
+    .with_highlights_query("(emphasis) @emphasis")
     .unwrap()
 }
 

@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::{Editor, ToPoint};
 use collections::HashSet;
 use futures::Future;
-use gpui::{AssetSource, View, ViewContext, VisualTestContext};
+use gpui::{View, ViewContext, VisualTestContext};
 use indoc::indoc;
 use language::{
     point_to_lsp, FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, LanguageQueries,
@@ -27,7 +27,7 @@ pub struct EditorLspTestContext {
     pub cx: EditorTestContext,
     pub lsp: lsp::FakeLanguageServer,
     pub workspace: View<Workspace>,
-    pub buffer_lsp_url: lsp::Uri,
+    pub buffer_lsp_url: lsp::Url,
 }
 
 impl EditorLspTestContext {
@@ -39,12 +39,7 @@ impl EditorLspTestContext {
         let app_state = cx.update(AppState::test);
 
         cx.update(|cx| {
-            cx.text_system()
-                .add_fonts(vec![assets::Assets
-                    .load("fonts/zed-mono/zed-mono-extended.ttf")
-                    .unwrap()
-                    .unwrap()])
-                .unwrap();
+            assets::Assets.load_test_fonts(cx);
             language::init(cx);
             crate::init(cx);
             workspace::init(app_state.clone(), cx);
@@ -62,8 +57,8 @@ impl EditorLspTestContext {
         let project = Project::test(app_state.fs.clone(), [], cx).await;
 
         let language_registry = project.read_with(cx, |project, _| project.languages().clone());
-        let mut fake_servers = language_registry.register_fake_lsp_adapter(
-            language.name().as_ref(),
+        let mut fake_servers = language_registry.register_fake_lsp(
+            language.name(),
             FakeLspAdapter {
                 capabilities,
                 ..Default::default()
@@ -84,7 +79,7 @@ impl EditorLspTestContext {
         let mut cx = VisualTestContext::from_window(*window.deref(), cx);
         project
             .update(&mut cx, |project, cx| {
-                project.find_or_create_local_worktree("/root", true, cx)
+                project.find_or_create_worktree("/root", true, cx)
             })
             .await
             .unwrap();
@@ -113,7 +108,7 @@ impl EditorLspTestContext {
             },
             lsp,
             workspace,
-            buffer_lsp_url: lsp::Uri::from_file_path(format!("/root/dir/{file_name}")).unwrap(),
+            buffer_lsp_url: lsp::Url::from_file_path(format!("/root/dir/{file_name}")).unwrap(),
         }
     }
 
@@ -130,7 +125,7 @@ impl EditorLspTestContext {
                 },
                 ..Default::default()
             },
-            Some(tree_sitter_rust::language()),
+            Some(tree_sitter_rust::LANGUAGE.into()),
         )
         .with_queries(LanguageQueries {
             indents: Some(Cow::from(indoc! {r#"
@@ -181,6 +176,7 @@ impl EditorLspTestContext {
                         start: "{".to_string(),
                         end: "}".to_string(),
                         close: true,
+                        surround: true,
                         newline: true,
                     }],
                     disabled_scopes_by_bracket_ix: Default::default(),
@@ -188,7 +184,7 @@ impl EditorLspTestContext {
                 word_characters,
                 ..Default::default()
             },
-            Some(tree_sitter_typescript::language_typescript()),
+            Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         )
         .with_queries(LanguageQueries {
             brackets: Some(Cow::from(indoc! {r#"
@@ -230,6 +226,7 @@ impl EditorLspTestContext {
                     ..Default::default()
                 },
                 block_comment: Some(("<!-- ".into(), " -->".into())),
+                word_characters: ['-'].into_iter().collect(),
                 ..Default::default()
             },
             Some(tree_sitter_html::language()),
@@ -299,7 +296,7 @@ impl EditorLspTestContext {
     where
         T: 'static + request::Request,
         T::Params: 'static + Send,
-        F: 'static + Send + FnMut(lsp::Uri, T::Params, gpui::AsyncAppContext) -> Fut,
+        F: 'static + Send + FnMut(lsp::Url, T::Params, gpui::AsyncAppContext) -> Fut,
         Fut: 'static + Send + Future<Output = Result<T::Result>>,
     {
         let url = self.buffer_lsp_url.clone();
